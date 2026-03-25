@@ -1,0 +1,250 @@
+# Calorie Estimator — Agent Tool
+
+A self-contained Python tool that estimates calories and macronutrients from food photos (+ optional text descriptions). Designed to be called by any agent framework — Telegram bots, Discord bots, API endpoints, CLI tools, etc.
+
+**Live deployment:** http://w00kkgowkg4cco44coo440kw.37.27.242.72.sslip.io:3000
+
+## Architecture
+
+```
+Agent (Telegram bot, etc.)
+  │
+  │  estimate(image_bytes, text_description?)
+  │
+  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  CalorieEstimator                                               │
+│                                                                 │
+│  Stage 1: VISUAL ANALYSIS ──────────────────── (LLM + vision)  │
+│  │  Identify foods, cooking methods, reference objects          │
+│  │  Estimate dimensions and weight in grams                     │
+│  │  Assign confidence scores                                    │
+│  ▼                                                              │
+│  Stage 2: DATABASE LOOKUP ──────────────────── (USDA FDC API)  │
+│  │  For each food item, retrieve candidate nutrition entries     │
+│  │  Include cooking method + state in search query              │
+│  ▼                                                              │
+│  Stage 3: DISAMBIGUATION ───────────────────── (LLM, 2nd pass) │
+│  │  Re-prompt with photo + candidates + user text               │
+│  │  Select best database match per item                         │
+│  │  Adjust weight estimates if needed                           │
+│  ▼                                                              │
+│  Stage 4: CALCULATION ──────────────────────── (deterministic)  │
+│  │  nutrients = db_per_100g × (estimated_grams / 100)           │
+│  │  Apply bias corrections per food category                    │
+│  │  Aggregate meal totals                                       │
+│  ▼                                                              │
+│  Returns: MealEstimate (structured data)                        │
+└─────────────────────────────────────────────────────────────────┘
+  │
+  ▼
+Agent formats response for user
+```
+
+### Why this architecture?
+
+The research is clear on three things:
+
+1. **LLMs are good at identifying food and reasoning about portions, but bad at
+   recalling precise nutrition values.** So we use the LLM for perception and the
+   USDA database for numbers.
+
+2. **Chain-of-thought prompting for volumetric estimation significantly improves
+   accuracy.** Forcing the model through identify → measure dimensions → estimate
+   weight (rather than just "guess the calories") reduces portion size errors.
+
+3. **A disambiguation pass against database candidates improves food matching.**
+   Cooking method alone (fried vs baked) can change calories by 30-50%. The second
+   LLM call with real database options to choose from catches these distinctions.
+
+## Setup
+
+### Requirements
+
+```
+python >= 3.11
+anthropic >= 0.40.0    # or openai >= 1.0, google-genai, etc.
+httpx >= 0.27.0        # async HTTP for USDA API
+pydantic >= 2.0        # data models
+```
+
+### Install
+
+```bash
+pip install -e .
+# or
+pip install anthropic httpx pydantic
+```
+
+### Configuration
+
+```bash
+# Required
+export ANTHROPIC_API_KEY="sk-ant-..."       # or OPENAI_API_KEY for OpenAI
+export USDA_API_KEY="your-usda-key"         # free at https://fdc.nal.usda.gov/api-key-signup
+
+# Optional
+export CALORIE_ESTIMATOR_MODEL="claude-sonnet-4-20250514"  # default
+export CALORIE_ESTIMATOR_FALLBACK="true"    # use bundled data if API fails
+```
+
+Get a free USDA API key at: https://fdc.nal.usda.gov/api-key-signup
+
+## Quick Start
+
+```python
+from calorie_estimator import CalorieEstimator
+
+estimator = CalorieEstimator()
+
+# From a file
+with open("lunch.jpg", "rb") as f:
+    result = await estimator.estimate(
+        image=f.read(),
+        description="Chicken stir-fry with rice, cooked in sesame oil"
+    )
+
+print(result.total.calories)        # 685.2
+print(result.total.protein_g)       # 42.1
+print(result.format_summary())      # formatted text for the user
+
+# result.items gives you per-item breakdown
+for item in result.items:
+    print(f"{item.name}: {item.nutrients.calories} kcal ({item.weight_g}g)")
+```
+
+## Integration Examples
+
+### Telegram Bot
+
+See [examples/telegram_bot.py](examples/telegram_bot.py) for a full working example.
+
+```python
+# Minimal Telegram integration
+from calorie_estimator import CalorieEstimator
+
+estimator = CalorieEstimator()
+
+async def handle_photo(update, context):
+    photo = await update.message.photo[-1].get_file()
+    image_bytes = await photo.download_as_bytearray()
+
+    caption = update.message.caption or ""
+    result = await estimator.estimate(image=bytes(image_bytes), description=caption)
+
+    await update.message.reply_text(result.format_summary())
+```
+
+### As an Agent Tool (e.g. LangChain / Claude tool_use)
+
+```python
+# Tool definition for any agent framework
+CALORIE_TOOL = {
+    "name": "estimate_calories",
+    "description": "Estimate calories and macronutrients from a food photo. "
+                   "Returns per-item and total nutritional breakdown.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "image_base64": {
+                "type": "string",
+                "description": "Base64-encoded food image (JPEG or PNG)"
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional text description of the meal, "
+                               "cooking method, or portion context"
+            }
+        },
+        "required": ["image_base64"]
+    }
+}
+```
+
+### As a FastAPI Endpoint
+
+```python
+from fastapi import FastAPI, UploadFile, Form
+from calorie_estimator import CalorieEstimator
+
+app = FastAPI()
+estimator = CalorieEstimator()
+
+@app.post("/estimate")
+async def estimate(image: UploadFile, description: str = Form("")):
+    image_bytes = await image.read()
+    result = await estimator.estimate(image=image_bytes, description=description)
+    return result.model_dump()
+```
+
+## Configuration Options
+
+```python
+estimator = CalorieEstimator(
+    # LLM provider — "anthropic" (default), "openai", or "custom"
+    provider="anthropic",
+
+    # Model to use for vision analysis
+    model="claude-sonnet-4-20250514",
+
+    # USDA API key (or set USDA_API_KEY env var)
+    usda_api_key="your-key",
+
+    # Apply empirical bias corrections (recommended)
+    apply_bias_correction=True,
+
+    # Include hidden calorie estimates (cooking oil, etc.)
+    estimate_hidden_calories=True,
+
+    # Return confidence ranges for low-confidence items
+    include_confidence_ranges=True,
+
+    # Temperature for LLM calls (lower = more deterministic)
+    temperature=0.1,
+
+    # Custom correction factors (override defaults)
+    bias_corrections=None,
+)
+```
+
+## Accuracy Notes
+
+Based on published research (PMC 2025, DietAI24, Macroscanner):
+
+- **Expected MAPE**: ~25-35% for calories on typical meals
+- **Best case**: Simple, single-item meals with visible reference objects (~15-20%)
+- **Worst case**: Complex mixed dishes, sauces, hidden oils (~40-50%)
+- **Systematic bias**: LLMs tend to underestimate large portions and calorie-dense
+  foods (nuts, oils, sauces). The bias correction module addresses this.
+
+The text description input is your biggest accuracy lever — cooking method, oil
+used, sugar added, and portion context are invisible to the camera but can shift
+calories by 30%+.
+
+## Cost Per Estimate
+
+| Component | Approximate Cost |
+|-----------|-----------------|
+| Stage 1: Vision analysis | ~$0.01-0.02 |
+| Stage 3: Disambiguation | ~$0.01-0.02 |
+| USDA API | Free (1,000 req/hr) |
+| **Total** | **~$0.02-0.04** |
+
+## Project Structure
+
+```
+calorie-estimator/
+├── README.md                          # this file
+├── requirements.txt
+├── calorie_estimator/
+│   ├── __init__.py                    # public API
+│   ├── estimator.py                   # main orchestrator
+│   ├── prompts.py                     # all LLM prompts (Stage 1 & 3)
+│   ├── usda.py                        # USDA FoodData Central client
+│   ├── models.py                      # Pydantic data models
+│   └── corrections.py                 # bias corrections & hidden calorie heuristics
+├── data/
+│   └── common_foods.json              # fallback nutrition data (top 500 foods)
+└── examples/
+    └── telegram_bot.py                # full Telegram bot example
+```
