@@ -56,14 +56,28 @@ class LocalUSDAClient:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
 
+    @staticmethod
+    def _sanitize_fts(query: str) -> str:
+        """Escape a query string for safe use in FTS5 MATCH expressions.
+
+        Wraps each token in double quotes so FTS5 treats them as literal phrases
+        rather than operators or column references.
+        """
+        import re
+        # Strip FTS5 special chars, keep alphanumeric + spaces
+        cleaned = re.sub(r'[^\w\s]', ' ', query, flags=re.UNICODE)
+        words = [w for w in cleaned.split() if w]
+        if not words:
+            return '""'
+        # Wrap each word in quotes → FTS5 literal phrase match per word
+        return " OR ".join(f'"{w}"' for w in words)
+
     def _query_sync(self, query: str, max_results: int) -> list[USDACandidate]:
         """Run the FTS5 search synchronously (called via asyncio.to_thread)."""
         conn = sqlite3.connect(str(self._db_path))
         conn.row_factory = sqlite3.Row
         try:
-            # Build an OR query from words for broader matching
-            words = query.strip().split()
-            fts_query = " OR ".join(words) if words else query
+            fts_query = self._sanitize_fts(query)
 
             rows = conn.execute(
                 """
