@@ -173,6 +173,7 @@ class CalorieEstimator:
 
         try:
             data = _parse_json(response_text)
+            data = _normalize_enums(data)
             return VisualAnalysis.model_validate(data)
         except Exception as e:
             logger.error(f"Failed to parse Stage 1 output: {e}")
@@ -653,3 +654,30 @@ def _parse_json(text: str) -> dict:
         lines = [l for l in lines if not l.strip().startswith("```")]
         text = "\n".join(lines).strip()
     return json.loads(text)
+
+
+def _normalize_enums(data: dict) -> dict:
+    """Normalize LLM enum outputs to valid values.
+
+    The LLM sometimes returns descriptive strings like "good natural light"
+    instead of the strict enum value "good". Map them to the nearest valid
+    ImageQuality value before Pydantic validation.
+    """
+    _QUALITY_MAP = {"good": "good", "moderate": "moderate", "poor": "poor"}
+
+    def _coerce_quality(val: str) -> str:
+        if not isinstance(val, str):
+            return "moderate"
+        v = val.lower()
+        for key in ("poor", "moderate", "good"):
+            if key in v:
+                return key
+        return "moderate"
+
+    scene = data.get("scene", {})
+    if isinstance(scene, dict):
+        for field in ("lighting_quality", "image_quality"):
+            if field in scene:
+                scene[field] = _coerce_quality(scene[field])
+
+    return data
