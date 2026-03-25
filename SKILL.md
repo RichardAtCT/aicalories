@@ -58,7 +58,7 @@ cat ~/.openclaw/agents/main/agent/auth-profiles.json | python3.13 -c \
 
 ```bash
 set -a; source ~/.openclaw/workspace/.env.macroagent; set +a
-curl -s -H "Authorization: Bearer $MACROTRACK_API_KEY" "$MACROTRACK_BASE_URL/api/onboard-status"
+curl -s -H "Authorization: Bearer $MACROTRACK_API_KEY" "$MACROTRACK_BASE_URL/api/stats/onboard-status"
 ```
 
 If `ready` is `false`, complete what's missing before logging food (profile → targets → first weight).
