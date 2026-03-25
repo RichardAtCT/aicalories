@@ -26,6 +26,12 @@ Use this skill when:
 pip3.13 install anthropic httpx pydantic openai --break-system-packages
 ```
 
+**Local USDA database (optional, for offline use):**
+```bash
+python3.13 ~/.openclaw/skills/aicalories/scripts/build_db.py
+```
+This builds a local SQLite database from USDA FoodData Central (~300 MB download, ~50 MB DB). Once built, the estimator uses it automatically — no `USDA_API_KEY` required.
+
 **Environment:** `~/.openclaw/workspace/.env.aicalories`
 ```bash
 # Anthropic OAuth token (from ~/.openclaw/agents/main/agent/auth-profiles.json)

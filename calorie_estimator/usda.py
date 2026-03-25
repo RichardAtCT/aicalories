@@ -1,8 +1,9 @@
 """USDA FoodData Central API client.
 
 Searches the USDA FDC database for food items and retrieves their
-nutritional data. Falls back to a bundled common foods file if the
-API is unavailable.
+nutritional data. Prefers a local SQLite database (built by
+scripts/build_db.py) for offline use. Falls back to the live API,
+then to a bundled common foods file.
 
 API docs: https://fdc.nal.usda.gov/api-guide
 Rate limit: 1,000 requests per hour per API key (free tier).
@@ -10,9 +11,11 @@ Rate limit: 1,000 requests per hour per API key (free tier).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import sqlite3
 from pathlib import Path
 
 import httpx
@@ -20,6 +23,8 @@ import httpx
 from .models import USDACandidate
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "usda.db"
 
 FDC_BASE_URL = "https://api.nal.usda.gov/fdc/v1"
 
@@ -42,6 +47,77 @@ NUTRIENT_MAP = {
 }
 
 
+class LocalUSDAClient:
+    """Offline USDA client backed by a local SQLite + FTS5 database."""
+
+    # Data type preference: lower = better
+    _TYPE_RANK = {"Survey (FNDDS)": 0, "Foundation": 1, "SR Legacy": 2}
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
+
+    def _query_sync(self, query: str, max_results: int) -> list[USDACandidate]:
+        """Run the FTS5 search synchronously (called via asyncio.to_thread)."""
+        conn = sqlite3.connect(str(self._db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            # Build an OR query from words for broader matching
+            words = query.strip().split()
+            fts_query = " OR ".join(words) if words else query
+
+            rows = conn.execute(
+                """
+                SELECT f.*
+                FROM foods_fts fts
+                JOIN foods f ON f.fdc_id = fts.rowid
+                WHERE foods_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, max_results * 3),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return []
+
+        # Sort by data type preference, keep BM25 rank as tiebreaker
+        def sort_key(r: sqlite3.Row) -> tuple[int, int]:
+            idx = rows.index(r)  # original rank position
+            type_rank = self._TYPE_RANK.get(r["data_type"], 9)
+            return (type_rank, idx)
+
+        rows_sorted = sorted(rows, key=sort_key)
+
+        candidates = []
+        for r in rows_sorted[:max_results]:
+            if r["calories_per_100g"] <= 0:
+                continue
+            candidates.append(
+                USDACandidate(
+                    fdc_id=r["fdc_id"],
+                    description=r["description"],
+                    food_category=r["food_category"] or "",
+                    serving_size_g=r["serving_size_g"],
+                    serving_description=r["serving_description"] or "",
+                    calories_per_100g=r["calories_per_100g"] or 0,
+                    protein_per_100g=r["protein_per_100g"] or 0,
+                    fat_per_100g=r["fat_per_100g"] or 0,
+                    carbs_per_100g=r["carbs_per_100g"] or 0,
+                    fiber_per_100g=r["fiber_per_100g"] or 0,
+                    sugar_per_100g=r["sugar_per_100g"] or 0,
+                    sodium_per_100g=r["sodium_per_100g"] or 0,
+                    saturated_fat_per_100g=r["saturated_fat_per_100g"] or 0,
+                )
+            )
+        return candidates
+
+    async def search(self, query: str, max_results: int = 5) -> list[USDACandidate]:
+        """Search the local database asynchronously."""
+        return await asyncio.to_thread(self._query_sync, query, max_results)
+
+
 class USDAClient:
     """Async client for the USDA FoodData Central API."""
 
@@ -55,6 +131,13 @@ class USDAClient:
         self.use_fallback = use_fallback
         self.timeout = timeout
         self._fallback_data: dict | None = None
+
+        # Prefer local DB when available
+        if _LOCAL_DB_PATH.exists():
+            self._local: LocalUSDAClient | None = LocalUSDAClient(_LOCAL_DB_PATH)
+            logger.info("Using local USDA database at %s", _LOCAL_DB_PATH)
+        else:
+            self._local = None
 
     async def search(
         self,
@@ -71,6 +154,15 @@ class USDAClient:
         Returns:
             List of USDACandidate objects with nutrition data.
         """
+        # Try local DB first
+        if self._local:
+            try:
+                results = await self._local.search(query, max_results)
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"Local USDA DB search failed: {e}")
+
         if self.api_key:
             try:
                 return await self._search_api(query, max_results)

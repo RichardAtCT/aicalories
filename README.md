@@ -135,6 +135,19 @@ Without a USDA key the estimator falls back to single-pass LLM estimation using 
 bundled dataset of ~500 common foods. Accuracy is lower (~35-50% MAPE vs ~25-35%
 with the full pipeline).
 
+### Local Database (optional, recommended)
+
+Build a local copy of the USDA FoodData Central database for offline use:
+
+```bash
+python scripts/build_db.py
+```
+
+This downloads three USDA datasets (~300 MB download) and builds a SQLite database
+with FTS5 full-text search (~50 MB). One-time setup — no USDA API key needed after
+that. The local DB is auto-detected; if absent, the estimator falls back to the live
+API as before.
+
 ## Quick Start
 
 ```python
@@ -286,10 +299,13 @@ aicalories/
 │   ├── __init__.py                    # public API
 │   ├── estimator.py                   # main orchestrator
 │   ├── prompts.py                     # all LLM prompts (Stage 1 & 3)
-│   ├── usda.py                        # USDA FoodData Central client
+│   ├── usda.py                        # USDA FoodData Central client (local DB + API)
 │   ├── models.py                      # Pydantic data models
 │   └── corrections.py                 # bias corrections & hidden calorie heuristics
+├── scripts/
+│   └── build_db.py                    # build local USDA SQLite database
 ├── data/
-│   └── common_foods.json              # fallback nutrition data (top 500 foods)
+│   ├── common_foods.json              # fallback nutrition data (top 500 foods)
+│   └── usda.db                        # local USDA database (git-ignored, built by scripts/build_db.py)
 └── telegram_bot.py                    # example Telegram bot integration
 ```
