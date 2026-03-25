@@ -32,7 +32,13 @@ python3.13 ~/.openclaw/skills/aicalories/scripts/build_db.py
 ```
 This builds a local SQLite database from USDA FoodData Central (~300 MB download, ~50 MB DB). Once built, the estimator uses it automatically — no `USDA_API_KEY` required.
 
-**Environment:** `~/.openclaw/workspace/.env.aicalories`
+**MacroTrack env:** `~/.openclaw/workspace/.env.macroagent`
+```
+MACROTRACK_BASE_URL=http://w00kkgowkg4cco44coo440kw.37.27.242.72.sslip.io:3000
+MACROTRACK_API_KEY=<key>
+```
+
+**Aicalories env:** `~/.openclaw/workspace/.env.aicalories`
 ```bash
 # Anthropic OAuth token (from ~/.openclaw/agents/main/agent/auth-profiles.json)
 ANTHROPIC_API_KEY=<sk-ant-oat-...token...>
@@ -60,32 +66,48 @@ Get the most recently saved image:
 FOOD_IMG=$(ls -t ~/.openclaw/workspace/tmp/img-*.jpg 2>/dev/null | head -1)
 ```
 
-### 2. Run the estimator
+### 2. Run the estimator + log to MacroTrack
 
 ```bash
-# Load env vars
-set -a; source ~/.openclaw/workspace/.env.aicalories; set +a
+# Load both env files
+set -a
+source ~/.openclaw/workspace/.env.aicalories
+source ~/.openclaw/workspace/.env.macroagent
+set +a
 
-# Basic (no description)
-python3.13 ~/.openclaw/skills/aicalories/run.py --image "$FOOD_IMG"
-
-# With a description (better accuracy — use any caption Richard provided)
+# Estimate + auto-log to MacroTrack (default for food photos)
 python3.13 ~/.openclaw/skills/aicalories/run.py \
   --image "$FOOD_IMG" \
-  --description "grilled salmon with roasted vegetables, no sauce"
+  --description "grilled salmon with roasted vegetables, no sauce" \
+  --log
 
-# Compact one-liner (useful for quick replies)
-python3.13 ~/.openclaw/skills/aicalories/run.py --image "$FOOD_IMG" --compact
+# With explicit meal type
+python3.13 ~/.openclaw/skills/aicalories/run.py \
+  --image "$FOOD_IMG" \
+  --description "..." \
+  --log --meal-type lunch
+
+# Estimate only (no logging)
+python3.13 ~/.openclaw/skills/aicalories/run.py --image "$FOOD_IMG"
 ```
 
 ### 3. Reply to Richard
 
-Format the output naturally:
-- Lead with the total calories in bold
-- Include per-item breakdown
-- Mention confidence if low
-- Note hidden calories (oil, butter, etc.) if present
-- Keep it concise — Richard doesn't need the raw JSON
+After `--log`, the script prints:
+- Full macro breakdown per item
+- `✅ Logged to MacroTrack — lunch`
+- Today's running total and **remaining budget**
+
+Format your reply as:
+- Lead with total calories + remaining budget
+- Brief per-item breakdown
+- Protein status (is he on track for his 165g daily target?)
+- Keep it under 5 lines — no walls of text
+
+**Example:**
+> 🍽️ **581 kcal logged** · 1,646 kcal remaining
+> - Chicken thigh (194g) · Rice (155g) · Broccoli (90g) · Honey mustard sauce
+> Protein: 45g today, 120g still to go — front-load dinner if you can.
 
 **Example reply:**
 > 🍽️ **~590 kcal**

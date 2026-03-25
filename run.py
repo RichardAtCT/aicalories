@@ -66,6 +66,15 @@ def parse_args() -> argparse.Namespace:
         "--base-url", metavar="URL", default=None,
         help="Custom base URL for OpenAI-compatible endpoints (e.g. local gateway)",
     )
+    parser.add_argument(
+        "--log", action="store_true",
+        help="Log the estimate to MacroTrack API (requires MACROTRACK_BASE_URL + MACROTRACK_API_KEY)",
+    )
+    parser.add_argument(
+        "--meal-type", choices=["breakfast", "lunch", "dinner", "snack"],
+        default=None,
+        help="Meal type for logging (default: inferred from local time)",
+    )
 
     return parser.parse_args()
 
@@ -144,6 +153,99 @@ async def main() -> None:
         print(result.model_dump_json(indent=2))
     else:
         print(result.format_summary(include_hidden=not args.no_hidden))
+
+    # ── Log to MacroTrack ───────────────────────────────────────────────────────
+    if args.log:
+        await _log_to_macrotrack(result, args)
+
+
+def _infer_meal_type() -> str:
+    """Infer meal type from local hour."""
+    from datetime import datetime
+    hour = datetime.now().hour
+    if 5 <= hour < 10:
+        return "breakfast"
+    elif 10 <= hour < 15:
+        return "lunch"
+    elif 15 <= hour < 18:
+        return "snack"
+    else:
+        return "dinner"
+
+
+async def _log_to_macrotrack(result, args) -> None:
+    """POST the meal estimate to the MacroTrack API."""
+    import json as _json
+    import urllib.request as _req
+
+    base_url = os.environ.get("MACROTRACK_BASE_URL", "").rstrip("/")
+    api_key = os.environ.get("MACROTRACK_API_KEY", "")
+
+    if not base_url or not api_key:
+        print("\n⚠️  MACROTRACK_BASE_URL or MACROTRACK_API_KEY not set — skipping log.", file=sys.stderr)
+        return
+
+    total = result.total_with_hidden
+    meal_type = args.meal_type or _infer_meal_type()
+
+    # Build a readable description from item names
+    item_names = ", ".join(i.name for i in result.items) if result.items else (args.description or "meal")
+    if args.description:
+        description = f"{args.description} ({item_names})" if item_names not in args.description else args.description
+    else:
+        description = item_names
+
+    from datetime import datetime, timezone
+    logged_at = datetime.now(timezone.utc).isoformat()
+
+    payload = _json.dumps({
+        "calories": round(total.calories),
+        "protein":  round(total.protein_g, 1),
+        "carbs":    round(total.carbs_g, 1),
+        "fat":      round(total.fat_g, 1),
+        "description": description[:200],
+        "logged_at": logged_at,
+        "meal_type": meal_type,
+    }).encode()
+
+    req = _req.Request(
+        f"{base_url}/api/food",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with _req.urlopen(req, timeout=10) as resp:
+            logged = _json.loads(resp.read())
+    except Exception as e:
+        print(f"\n⚠️  MacroTrack log failed: {e}", file=sys.stderr)
+        return
+
+    # Fetch today's stats for remaining budget
+    stats_req = _req.Request(
+        f"{base_url}/api/stats/today",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with _req.urlopen(stats_req, timeout=10) as resp:
+            stats = _json.loads(resp.read())
+        rem = stats.get("remaining", {})
+        intake = stats.get("intake", {})
+        print(f"\n✅  Logged to MacroTrack — {meal_type}")
+        print(f"   Today so far:  {intake.get('calories', 0)} kcal | "
+              f"P {intake.get('protein', 0):.0f}g  "
+              f"C {intake.get('carbs', 0):.0f}g  "
+              f"F {intake.get('fat', 0):.0f}g")
+        print(f"   Remaining:     {rem.get('calories', '?')} kcal | "
+              f"P {rem.get('protein', '?'):.0f}g  "
+              f"C {rem.get('carbs', '?'):.0f}g  "
+              f"F {rem.get('fat', '?'):.0f}g")
+    except Exception:
+        print(f"\n✅  Logged to MacroTrack (ID: {logged.get('id', '?')})")
 
 
 if __name__ == "__main__":
