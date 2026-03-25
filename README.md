@@ -57,13 +57,55 @@ The research is clear on three things:
    Cooking method alone (fried vs baked) can change calories by 30-50%. The second
    LLM call with real database options to choose from catches these distinctions.
 
+## CLI
+
+`run.py` is a standalone CLI wrapper — no server, no bot token needed.
+
+```bash
+# Basic usage
+python run.py --image /path/to/food.jpg
+
+# With a description for better accuracy
+python run.py --image /path/to/food.jpg --description "fried in olive oil, large portion"
+
+# From a URL
+python run.py --url https://example.com/meal.jpg --description "pasta carbonara"
+
+# Raw JSON output (for scripting / agent tools)
+python run.py --image food.jpg --json
+
+# One-line compact summary
+python run.py --image food.jpg --compact
+
+# Exclude hidden calorie estimates (cooking oil, butter, etc.)
+python run.py --image food.jpg --no-hidden
+```
+
+**Output example:**
+```
+🍽️ **Meal Estimate**
+
+**Grilled chicken breast, no skin** (185g) — 306 kcal  [●●●●○]
+  P: 57g · F: 7g · C: 0g
+
+**Brown rice, cooked** (220g) — 240 kcal  [●●●●○]
+  P: 5g · F: 2g · C: 51g
+
+_Estimated hidden calories:_
+  +45 kcal — cooking oil (brushed on grill)
+
+────────────────────────────────────
+**TOTAL: 591 kcal**
+Protein: 62g · Fat: 10g · Carbs: 51g · Fiber: 4g
+```
+
 ## Setup
 
 ### Requirements
 
 ```
 python >= 3.11
-anthropic >= 0.40.0    # or openai >= 1.0, google-genai, etc.
+anthropic >= 0.40.0
 httpx >= 0.27.0        # async HTTP for USDA API
 pydantic >= 2.0        # data models
 ```
@@ -71,24 +113,27 @@ pydantic >= 2.0        # data models
 ### Install
 
 ```bash
-pip install -e .
-# or
-pip install anthropic httpx pydantic
+pip install -r requirements.txt
 ```
 
 ### Configuration
 
 ```bash
 # Required
-export ANTHROPIC_API_KEY="sk-ant-..."       # or OPENAI_API_KEY for OpenAI
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# Recommended (free key — better accuracy via USDA database)
 export USDA_API_KEY="your-usda-key"         # free at https://fdc.nal.usda.gov/api-key-signup
 
 # Optional
 export CALORIE_ESTIMATOR_MODEL="claude-sonnet-4-20250514"  # default
-export CALORIE_ESTIMATOR_FALLBACK="true"    # use bundled data if API fails
 ```
 
 Get a free USDA API key at: https://fdc.nal.usda.gov/api-key-signup
+
+Without a USDA key the estimator falls back to single-pass LLM estimation using a
+bundled dataset of ~500 common foods. Accuracy is lower (~35-50% MAPE vs ~25-35%
+with the full pipeline).
 
 ## Quick Start
 
@@ -233,9 +278,10 @@ calories by 30%+.
 ## Project Structure
 
 ```
-calorie-estimator/
+aicalories/
 ├── README.md                          # this file
 ├── requirements.txt
+├── run.py                             # CLI entry point
 ├── calorie_estimator/
 │   ├── __init__.py                    # public API
 │   ├── estimator.py                   # main orchestrator
@@ -245,6 +291,5 @@ calorie-estimator/
 │   └── corrections.py                 # bias corrections & hidden calorie heuristics
 ├── data/
 │   └── common_foods.json              # fallback nutrition data (top 500 foods)
-└── examples/
-    └── telegram_bot.py                # full Telegram bot example
+└── telegram_bot.py                    # example Telegram bot integration
 ```
