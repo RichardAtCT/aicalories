@@ -61,6 +61,7 @@ class CalorieEstimator:
         provider: Literal["anthropic", "openai"] = "anthropic",
         model: str | None = None,
         api_key: str | None = None,
+        base_url: str | None = None,
         usda_api_key: str | None = None,
         apply_bias_correction: bool = True,
         estimate_hidden_cals: bool = True,
@@ -74,6 +75,7 @@ class CalorieEstimator:
         self.estimate_hidden_cals = estimate_hidden_cals
         self.include_confidence_ranges = include_confidence_ranges
         self.bias_corrections = bias_corrections or DEFAULT_BIAS_CORRECTIONS
+        self.base_url = base_url or os.environ.get("CALORIE_ESTIMATOR_BASE_URL")
 
         # Set defaults per provider
         if provider == "anthropic":
@@ -539,7 +541,10 @@ class CalorieEstimator:
         """Call OpenAI's Chat Completions API with vision."""
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=self.api_key)
+        client = AsyncOpenAI(
+            api_key=self.api_key,
+            **({"base_url": self.base_url} if self.base_url else {}),
+        )
 
         response = await client.chat.completions.create(
             model=self.model,

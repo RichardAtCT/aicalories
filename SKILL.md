@@ -19,16 +19,25 @@ Use this skill when:
 
 **Location:** `~/.openclaw/skills/aicalories/`
 
+**Python:** Use `python3.13` (code uses `X | Y` union syntax requiring Python 3.10+)
+
 **Dependencies:**
 ```bash
-cd ~/.openclaw/skills/aicalories
-pip install -r requirements.txt
+pip3.13 install anthropic httpx pydantic openai --break-system-packages
 ```
 
 **Environment:** `~/.openclaw/workspace/.env.aicalories`
-```
-ANTHROPIC_API_KEY=<from main env>
+```bash
+# Anthropic OAuth token (from ~/.openclaw/agents/main/agent/auth-profiles.json)
+ANTHROPIC_API_KEY=<sk-ant-oat-...token...>
 USDA_API_KEY=<your-usda-key>
+CALORIE_ESTIMATOR_MODEL=claude-haiku-4-5
+```
+
+To extract the Anthropic token:
+```bash
+cat ~/.openclaw/agents/main/agent/auth-profiles.json | python3.13 -c \
+  "import sys,json; d=json.load(sys.stdin); print(d['profiles']['anthropic:default']['token'])"
 ```
 
 ## How to Use
@@ -49,18 +58,18 @@ FOOD_IMG=$(ls -t ~/.openclaw/workspace/tmp/img-*.jpg 2>/dev/null | head -1)
 
 ```bash
 # Load env vars
-source ~/.openclaw/workspace/.env.aicalories
+set -a; source ~/.openclaw/workspace/.env.aicalories; set +a
 
 # Basic (no description)
-python ~/.openclaw/skills/aicalories/run.py --image "$FOOD_IMG"
+python3.13 ~/.openclaw/skills/aicalories/run.py --image "$FOOD_IMG"
 
 # With a description (better accuracy — use any caption Richard provided)
-python ~/.openclaw/skills/aicalories/run.py \
+python3.13 ~/.openclaw/skills/aicalories/run.py \
   --image "$FOOD_IMG" \
   --description "grilled salmon with roasted vegetables, no sauce"
 
 # Compact one-liner (useful for quick replies)
-python ~/.openclaw/skills/aicalories/run.py --image "$FOOD_IMG" --compact
+python3.13 ~/.openclaw/skills/aicalories/run.py --image "$FOOD_IMG" --compact
 ```
 
 ### 3. Reply to Richard

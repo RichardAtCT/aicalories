@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         "--compact", action="store_true",
         help="One-line summary (overrides --json)",
     )
+    parser.add_argument(
+        "--provider", choices=["anthropic", "openai"], default="anthropic",
+        help="LLM provider (default: anthropic)",
+    )
+    parser.add_argument(
+        "--base-url", metavar="URL", default=None,
+        help="Custom base URL for OpenAI-compatible endpoints (e.g. local gateway)",
+    )
 
     return parser.parse_args()
 
@@ -93,8 +101,12 @@ async def main() -> None:
             os.unlink(tmp_path)
 
     # ── Check API key ──────────────────────────────────────────────────────────
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    provider = args.provider
+    if provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
         print("Error: ANTHROPIC_API_KEY environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+    if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        print("Error: OPENAI_API_KEY environment variable is not set.", file=sys.stderr)
         sys.exit(1)
 
     # ── Import package ─────────────────────────────────────────────────────────
@@ -109,7 +121,8 @@ async def main() -> None:
 
     # ── Run estimator ──────────────────────────────────────────────────────────
     estimator = CalorieEstimator(
-        provider="anthropic",
+        provider=args.provider,
+        base_url=args.base_url,
         apply_bias_correction=True,
         estimate_hidden_cals=not args.no_hidden,
         include_confidence_ranges=True,
