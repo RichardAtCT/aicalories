@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Large binary data files (build locally)
+data/usda_embeddings.npz
+data/usda.db
