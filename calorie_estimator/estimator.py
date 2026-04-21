@@ -17,6 +17,7 @@ import json
 import logging
 import mimetypes
 import os
+from pathlib import Path
 from typing import Literal
 
 from .corrections import (
@@ -58,7 +59,7 @@ class CalorieEstimator:
 
     def __init__(
         self,
-        provider: Literal["anthropic", "openai"] = "anthropic",
+        provider: Literal["anthropic", "openai", "openai-codex"] = "anthropic",
         model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
@@ -89,6 +90,20 @@ class CalorieEstimator:
                 "CALORIE_ESTIMATOR_MODEL", "gpt-4o"
             )
             self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        elif provider == "openai-codex":
+            self.model = model or os.environ.get(
+                "CALORIE_ESTIMATOR_MODEL", "gpt-5.4"
+            )
+            self.base_url = (
+                base_url
+                or os.environ.get("CALORIE_ESTIMATOR_BASE_URL")
+                or "https://chatgpt.com/backend-api/codex"
+            )
+            self.api_key = (
+                api_key
+                or os.environ.get("CODEX_ACCESS_TOKEN", "")
+                or self._read_codex_access_token()
+            )
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
@@ -492,8 +507,49 @@ class CalorieEstimator:
             return await self._call_anthropic(system, user_text, image_b64, media_type)
         elif self.provider == "openai":
             return await self._call_openai(system, user_text, image_b64, media_type)
+        elif self.provider == "openai-codex":
+            return await self._call_openai_codex(system, user_text, image_b64, media_type)
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
+
+    def _read_codex_access_token(self) -> str:
+        """Read a Codex OAuth token from env or Hermes auth.json when available."""
+        env_token = os.environ.get("CODEX_ACCESS_TOKEN", "").strip()
+        if env_token:
+            return env_token
+
+        hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+        auth_path = hermes_home / "auth.json"
+        try:
+            data = json.loads(auth_path.read_text())
+            return str(
+                data.get("providers", {})
+                .get("openai-codex", {})
+                .get("tokens", {})
+                .get("access_token", "")
+            ).strip()
+        except Exception:
+            return ""
+
+    def _codex_cloudflare_headers(self, access_token: str) -> dict[str, str]:
+        """Headers required for ChatGPT Codex endpoint access."""
+        headers = {
+            "User-Agent": "codex_cli_rs/0.0.0 (AI Calories)",
+            "originator": "codex_cli_rs",
+        }
+        if not access_token:
+            return headers
+        try:
+            parts = access_token.split(".")
+            if len(parts) >= 2:
+                payload = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(payload))
+                acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+                if isinstance(acct_id, str) and acct_id:
+                    headers["ChatGPT-Account-ID"] = acct_id
+        except Exception:
+            pass
+        return headers
 
     async def _call_anthropic(
         self,
@@ -573,6 +629,51 @@ class CalorieEstimator:
         )
 
         return response.choices[0].message.content
+
+    async def _call_openai_codex(
+        self,
+        system: str,
+        user_text: str,
+        image_b64: str,
+        media_type: str,
+    ) -> str:
+        """Call ChatGPT Codex Responses API with vision."""
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            default_headers=self._codex_cloudflare_headers(self.api_key),
+        )
+
+        with client.responses.stream(
+            model=self.model,
+            store=False,
+            instructions=system,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:{media_type};base64,{image_b64}",
+                            "detail": "high",
+                        },
+                        {"type": "input_text", "text": user_text},
+                    ],
+                }
+            ],
+        ) as stream:
+            text_parts: list[str] = []
+            for event in stream:
+                etype = getattr(event, "type", "")
+                if "output_text.delta" in etype:
+                    delta = getattr(event, "delta", "")
+                    if delta:
+                        text_parts.append(delta)
+            final = stream.get_final_response()
+
+        return "".join(text_parts).strip() or getattr(final, "output_text", "") or ""
 
     # ─────────────────────────────────────────────────────────
     # Agent Tool Interface
