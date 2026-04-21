@@ -6,7 +6,7 @@ Runs the 4-stage pipeline:
   Stage 3: Disambiguation (LLM, 2nd pass)
   Stage 4: Deterministic calculation
 
-Supports Anthropic (default) and OpenAI as LLM providers.
+Supports OpenAI Codex (default), Anthropic, and OpenAI as LLM providers.
 Falls back to a single-pass estimation if the USDA API is unavailable.
 """
 
@@ -60,7 +60,7 @@ class CalorieEstimator:
 
     def __init__(
         self,
-        provider: Literal["anthropic", "openai", "openai-codex"] = "anthropic",
+        provider: Literal["anthropic", "openai", "openai-codex"] = "openai-codex",
         model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,

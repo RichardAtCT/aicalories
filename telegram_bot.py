@@ -6,9 +6,9 @@ calorie/macro breakdown.
 Setup:
     1. Get a Telegram bot token from @BotFather
     2. Set environment variables:
-       export TELEGRAM_BOT_TOKEN="your-bot-token"
-       export ANTHROPIC_API_KEY="sk-ant-..."
-       export USDA_API_KEY="your-usda-key"
+       export TELEGRAM_BOT_TOKEN="***"
+       export CODEX_ACCESS_TOKEN="***"  # optional; otherwise uses ~/.hermes/auth.json
+       export USDA_API_KEY="***"
     3. pip install python-telegram-bot calorie-estimator
     4. python telegram_bot.py
 
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 # Initialise the estimator once at module level
 estimator = CalorieEstimator(
-    provider="anthropic",
+    provider="openai-codex",
     apply_bias_correction=True,
     estimate_hidden_cals=True,
     include_confidence_ranges=True,

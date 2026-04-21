@@ -11,10 +11,10 @@ Usage:
     python run.py --image food.jpg --no-hidden       # exclude hidden calorie estimates
 
 Environment variables:
-    ANTHROPIC_API_KEY   Required for --provider anthropic.
-    OPENAI_API_KEY      Required for --provider openai.
-    CODEX_ACCESS_TOKEN  Optional override for --provider openai-codex.
+    CODEX_ACCESS_TOKEN  Optional override for the default openai-codex provider.
                         Otherwise reads Codex auth from ~/.hermes/auth.json.
+    ANTHROPIC_API_KEY   Required only for --provider anthropic.
+    OPENAI_API_KEY      Required only for --provider openai.
     USDA_API_KEY        Optional. Free key from https://fdc.nal.usda.gov/api-key-signup
                         Falls back to bundled food database if not set.
 """
@@ -62,8 +62,8 @@ def parse_args() -> argparse.Namespace:
         help="One-line summary (overrides --json)",
     )
     parser.add_argument(
-        "--provider", choices=["anthropic", "openai", "openai-codex"], default="anthropic",
-        help="LLM provider (default: anthropic)",
+        "--provider", choices=["anthropic", "openai", "openai-codex"], default="openai-codex",
+        help="LLM provider (default: openai-codex)",
     )
     parser.add_argument(
         "--base-url", metavar="URL", default=None,
