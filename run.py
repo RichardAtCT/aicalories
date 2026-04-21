@@ -11,7 +11,10 @@ Usage:
     python run.py --image food.jpg --no-hidden       # exclude hidden calorie estimates
 
 Environment variables:
-    ANTHROPIC_API_KEY   Required. Anthropic API key.
+    ANTHROPIC_API_KEY   Required for --provider anthropic.
+    OPENAI_API_KEY      Required for --provider openai.
+    CODEX_ACCESS_TOKEN  Optional override for --provider openai-codex.
+                        Otherwise reads Codex auth from ~/.hermes/auth.json.
     USDA_API_KEY        Optional. Free key from https://fdc.nal.usda.gov/api-key-signup
                         Falls back to bundled food database if not set.
 """
@@ -59,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         help="One-line summary (overrides --json)",
     )
     parser.add_argument(
-        "--provider", choices=["anthropic", "openai"], default="anthropic",
+        "--provider", choices=["anthropic", "openai", "openai-codex"], default="anthropic",
         help="LLM provider (default: anthropic)",
     )
     parser.add_argument(
@@ -117,6 +120,15 @@ async def main() -> None:
     if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
         print("Error: OPENAI_API_KEY environment variable is not set.", file=sys.stderr)
         sys.exit(1)
+    if provider == "openai-codex":
+        codex_env = os.environ.get("CODEX_ACCESS_TOKEN", "").strip()
+        auth_path = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "auth.json"
+        if not codex_env and not auth_path.exists():
+            print(
+                "Error: openai-codex requires CODEX_ACCESS_TOKEN or a valid Hermes auth.json token.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # ── Import package ─────────────────────────────────────────────────────────
     # Support running from the repo root (calorie_estimator/ lives alongside run.py)
