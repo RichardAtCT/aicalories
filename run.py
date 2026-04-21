@@ -114,21 +114,6 @@ async def main() -> None:
 
     # ── Check API key ──────────────────────────────────────────────────────────
     provider = args.provider
-    if provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY environment variable is not set.", file=sys.stderr)
-        sys.exit(1)
-    if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
-        print("Error: OPENAI_API_KEY environment variable is not set.", file=sys.stderr)
-        sys.exit(1)
-    if provider == "openai-codex":
-        codex_env = os.environ.get("CODEX_ACCESS_TOKEN", "").strip()
-        auth_path = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "auth.json"
-        if not codex_env and not auth_path.exists():
-            print(
-                "Error: openai-codex requires CODEX_ACCESS_TOKEN or a valid Hermes auth.json token.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
 
     # ── Import package ─────────────────────────────────────────────────────────
     # Support running from the repo root (calorie_estimator/ lives alongside run.py)
@@ -137,7 +122,20 @@ async def main() -> None:
         from calorie_estimator import CalorieEstimator
     except ImportError as e:
         print(f"Error: could not import calorie_estimator — {e}", file=sys.stderr)
-        print("Install dependencies: pip install anthropic httpx pydantic", file=sys.stderr)
+        print("Install dependencies: pip install anthropic httpx pydantic openai", file=sys.stderr)
+        sys.exit(1)
+
+    if provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Error: ANTHROPIC_API_KEY environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+    if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        print("Error: OPENAI_API_KEY environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+    if provider == "openai-codex" and not CalorieEstimator.codex_auth_available():
+        print(
+            "Error: openai-codex requires CODEX_ACCESS_TOKEN or providers.openai-codex.tokens.access_token in Hermes auth.json.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # ── Run estimator ──────────────────────────────────────────────────────────
@@ -197,7 +195,8 @@ async def _log_to_macrotrack(result, args) -> None:
         print("\n⚠️  MACROTRACK_BASE_URL or MACROTRACK_API_KEY not set — skipping log.", file=sys.stderr)
         return
 
-    total = result.total_with_hidden
+    include_hidden = not args.no_hidden
+    total = result.total_with_hidden if include_hidden else result.total
     meal_type = args.meal_type or _infer_meal_type()
 
     # Build a readable description from item names

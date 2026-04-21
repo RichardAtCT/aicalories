@@ -12,6 +12,7 @@ Falls back to a single-pass estimation if the USDA API is unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -528,6 +529,27 @@ class CalorieEstimator:
         except Exception:
             return ""
 
+    @staticmethod
+    def codex_auth_available() -> bool:
+        """Return True when a Codex token is actually available."""
+        env_token = os.environ.get("CODEX_ACCESS_TOKEN", "").strip()
+        if env_token:
+            return True
+
+        hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+        auth_path = hermes_home / "auth.json"
+        try:
+            data = json.loads(auth_path.read_text())
+            token = str(
+                data.get("providers", {})
+                .get("openai-codex", {})
+                .get("tokens", {})
+                .get("access_token", "")
+            ).strip()
+            return bool(token)
+        except Exception:
+            return False
+
     def _codex_cloudflare_headers(self, access_token: str) -> dict[str, str]:
         """Headers required for ChatGPT Codex endpoint access."""
         headers = {
@@ -634,7 +656,23 @@ class CalorieEstimator:
         image_b64: str,
         media_type: str,
     ) -> str:
-        """Call ChatGPT Codex Responses API with vision."""
+        """Call ChatGPT Codex Responses API with vision without blocking the event loop."""
+        return await asyncio.to_thread(
+            self._call_openai_codex_sync,
+            system,
+            user_text,
+            image_b64,
+            media_type,
+        )
+
+    def _call_openai_codex_sync(
+        self,
+        system: str,
+        user_text: str,
+        image_b64: str,
+        media_type: str,
+    ) -> str:
+        """Synchronous Codex call, executed in a worker thread by async callers."""
         from openai import OpenAI
 
         client = OpenAI(
