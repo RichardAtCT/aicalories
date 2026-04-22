@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+ItemSource = Literal["usda", "barcode", "label_ocr", "fallback"]
 
 
 class ImageQuality(str, Enum):
@@ -109,6 +113,50 @@ class ItemCandidates(BaseModel):
     candidates: list[USDACandidate] = Field(default_factory=list)
 
 
+# ── Stage 0 alternate: Open Food Facts (barcode path) ───────
+
+
+class OpenFoodFactsProduct(BaseModel):
+    """A packaged-food product retrieved from the Open Food Facts API."""
+
+    barcode: str
+    product_name: str
+    brand: str = ""
+    serving_size_label: str = ""
+    serving_quantity_g: float | None = None
+    nutrients_per_100g: "NutrientProfile"
+    data_quality_warnings: list[str] = Field(default_factory=list)
+
+    def has_usable_nutrition(self) -> bool:
+        """OFF products are only useful if we have at least an energy value."""
+        return self.nutrients_per_100g.calories > 0
+
+
+class OFFContribution(BaseModel):
+    """Payload extracted from a nutrition-label photo, ready to submit to OFF.
+
+    Populated by the label-OCR path when the user re-shoots a packaged food
+    whose barcode was detected but missing from Open Food Facts. The caller
+    (bot / UI) is responsible for asking the user to confirm before submission.
+    """
+
+    barcode: str
+    product_name: str
+    brand: str = ""
+    serving_size_label: str = ""
+    serving_quantity_g: float | None = None
+    nutrients_per_100g: "NutrientProfile"
+    extraction_confidence: float = Field(ge=0, le=1, default=0.0)
+
+    def is_submittable(self) -> bool:
+        """Refuse to contribute partial/garbage data to OFF."""
+        return (
+            bool(self.barcode)
+            and bool(self.product_name.strip())
+            and self.nutrients_per_100g.calories > 0
+        )
+
+
 # ── Stage 3 output: Disambiguation ──────────────────────────
 
 
@@ -187,6 +235,11 @@ class ItemEstimate(BaseModel):
     confidence: float = 0.5
     category: FoodCategory = FoodCategory.OTHER
     notes: str = ""
+    source: ItemSource = "usda"
+    # Populated for barcode and label_ocr sources so the user can see which
+    # package serving was assumed and edit the amount if they ate more or less.
+    barcode: str | None = None
+    serving_size_label: str = ""
 
 
 class HiddenCalorieEstimate(BaseModel):
@@ -208,6 +261,12 @@ class MealEstimate(BaseModel):
     overall_confidence: float = 0.5
     warnings: list[str] = Field(default_factory=list)
     meal_context: str = ""
+    # Set when the barcode path failed (no data in OFF) so the caller can
+    # prompt the user to re-send a nutrition-label photo on the next turn.
+    needs_label_photo_for_barcode: str | None = None
+    # Populated by the label_ocr path: nutrition extracted from a label photo,
+    # ready to contribute back to Open Food Facts after user confirmation.
+    pending_off_contribution: "OFFContribution | None" = None
 
     def format_summary(self, include_hidden: bool = True) -> str:
         """Format a human-readable summary for chat responses."""
@@ -225,6 +284,17 @@ class MealEstimate(BaseModel):
                 f"F: {item.nutrients.fat_g:.0f}g · "
                 f"C: {item.nutrients.carbs_g:.0f}g"
             )
+            if item.source in ("barcode", "label_ocr"):
+                serving = item.serving_size_label or f"{item.weight_g:.0f} g"
+                provenance = (
+                    "from package label"
+                    if item.source == "barcode"
+                    else "read from your label photo"
+                )
+                lines.append(
+                    f"  📦 Per serving: {serving} "
+                    f"({provenance} — adjust if you ate more or less)"
+                )
             if item.range:
                 lines.append(
                     f"  ↕ Range: {item.range.low.calories:.0f}–"
@@ -254,6 +324,13 @@ class MealEstimate(BaseModel):
             for w in self.warnings:
                 lines.append(f"⚠️ {w}")
 
+        if self.pending_off_contribution is not None:
+            lines.append("")
+            lines.append(
+                "🆕 This product isn't in Open Food Facts yet. "
+                "Reply *yes* to add it and help the next person."
+            )
+
         return "\n".join(lines)
 
     def format_compact(self) -> str:
@@ -265,3 +342,9 @@ class MealEstimate(BaseModel):
             f"C {self.total_with_hidden.carbs_g:.0f}g | "
             f"{len(self.items)} items"
         )
+
+
+# Resolve forward references for models that reference each other by string.
+OpenFoodFactsProduct.model_rebuild()
+OFFContribution.model_rebuild()
+MealEstimate.model_rebuild()

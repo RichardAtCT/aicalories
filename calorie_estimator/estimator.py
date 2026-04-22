@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
+from . import barcode as barcode_detector
 from .corrections import (
     DEFAULT_BIAS_CORRECTIONS,
     apply_weight_correction,
@@ -34,13 +35,18 @@ from .models import (
     MealEstimate,
     NutrientProfile,
     NutrientRange,
+    OFFContribution,
+    OpenFoodFactsProduct,
     USDACandidate,
     VisualAnalysis,
 )
+from .openfoodfacts import OpenFoodFactsClient
 from .prompts import (
     FALLBACK_SYSTEM,
+    LABEL_OCR_SYSTEM,
     STAGE_1_SYSTEM,
     STAGE_3_SYSTEM,
+    build_label_ocr_user_message,
     build_stage_1_user_message,
     build_stage_3_user_message,
 )
@@ -108,12 +114,14 @@ class CalorieEstimator:
             raise ValueError(f"Unsupported provider: {provider}")
 
         self.usda = USDAClient(api_key=usda_api_key)
+        self.off = OpenFoodFactsClient()
 
     async def estimate(
         self,
         image: bytes,
         description: str | None = None,
         media_type: str | None = None,
+        barcode_hint: str | None = None,
     ) -> MealEstimate:
         """Run the full estimation pipeline.
 
@@ -121,6 +129,11 @@ class CalorieEstimator:
             image: Raw image bytes (JPEG, PNG, WebP, or GIF).
             description: Optional text description of the meal.
             media_type: MIME type of the image. Auto-detected if not provided.
+            barcode_hint: If set, treat this image as a nutrition-label
+                re-shoot for the given UPC/EAN — run the label-OCR path and
+                attach a pending Open Food Facts contribution to the result.
+                Callers typically set this after a previous turn returned a
+                MealEstimate with ``needs_label_photo_for_barcode`` populated.
 
         Returns:
             MealEstimate with per-item breakdown and totals.
@@ -129,6 +142,16 @@ class CalorieEstimator:
             media_type = _detect_media_type(image)
 
         image_b64 = base64.standard_b64encode(image).decode("utf-8")
+
+        # ── Label-OCR path: caller told us this is a re-shot label ───
+        if barcode_hint:
+            logger.info("Label-OCR path for barcode %s", barcode_hint)
+            return await self._stage_label_ocr(image_b64, media_type, barcode_hint)
+
+        # ── Stage 0: Barcode → Open Food Facts ──────────────
+        stage_0_result = await self._stage_0_barcode(image)
+        if stage_0_result is not None:
+            return stage_0_result
 
         # ── Stage 1: Visual Analysis ─────────────────────────
         logger.info("Stage 1: Visual analysis")
@@ -166,6 +189,176 @@ class CalorieEstimator:
             # Fallback: use Stage 1 estimates directly with fallback nutrition values
             logger.warning("No USDA candidates found; using fallback estimation")
             return await self._fallback_estimate(image_b64, media_type, description)
+
+    # ─────────────────────────────────────────────────────────
+    # Stage 0: Barcode → Open Food Facts
+    # ─────────────────────────────────────────────────────────
+
+    async def _stage_0_barcode(self, image: bytes) -> MealEstimate | None:
+        """Detect barcodes and resolve the first usable one via OFF.
+
+        Returns:
+            - A complete ``MealEstimate`` if a barcode resolves to an OFF
+              product with usable nutrition.
+            - An empty ``MealEstimate`` with a warning + ``needs_label_photo_for_barcode``
+              set if barcodes are found but OFF has no usable data for any of them.
+            - ``None`` when no barcode is detected, so the caller can fall
+              through to the regular visual pipeline.
+        """
+        codes = barcode_detector.detect_barcodes(image)
+        if not codes:
+            return None
+
+        logger.info("Detected barcodes: %s", codes)
+
+        resolved_but_empty: list[str] = []
+        for code in codes:
+            product = await self.off.lookup(code)
+            if product is None:
+                continue
+            if product.has_usable_nutrition():
+                return _meal_from_off_product(product)
+            resolved_but_empty.append(code)
+
+        # We saw barcodes — surface to the caller so they can prompt a
+        # nutrition-label re-shoot. The first detected code wins as the
+        # "hint" the caller should feed back in on the next turn.
+        if resolved_but_empty:
+            warning = (
+                f"Barcode {resolved_but_empty[0]} was found in Open Food Facts "
+                "but has no nutrition data. Please send a photo of the nutrition "
+                "label, or of the food itself, so I can estimate it."
+            )
+        else:
+            warning = (
+                f"Barcode {codes[0]} isn't in Open Food Facts yet. Please send a "
+                "photo of the nutrition label (and I'll add it for others), or "
+                "of the food itself if there is no label."
+            )
+        return MealEstimate(
+            warnings=[warning],
+            needs_label_photo_for_barcode=codes[0],
+        )
+
+    # ─────────────────────────────────────────────────────────
+    # Label OCR: read a re-shot nutrition label
+    # ─────────────────────────────────────────────────────────
+
+    async def _stage_label_ocr(
+        self,
+        image_b64: str,
+        media_type: str,
+        barcode: str,
+    ) -> MealEstimate:
+        """Read a nutrition label, return a MealEstimate + pending OFF contribution."""
+        response_text = await self._call_llm(
+            system=LABEL_OCR_SYSTEM,
+            user_text=build_label_ocr_user_message(barcode),
+            image_b64=image_b64,
+            media_type=media_type,
+        )
+
+        try:
+            data = _parse_json(response_text)
+        except Exception as e:
+            logger.error(f"Failed to parse label-OCR output: {e}")
+            return MealEstimate(
+                warnings=[
+                    "Couldn't read the nutrition label. Please try again with a "
+                    "closer, well-lit photo of the label — or a photo of the food "
+                    "itself and I'll estimate it visually."
+                ],
+                needs_label_photo_for_barcode=barcode,
+            )
+
+        product_name = (data.get("product_name") or "").strip()
+        nutrients_raw = data.get("nutrients_per_100g") or {}
+        extraction_conf = float(data.get("extraction_confidence") or 0.0)
+
+        nutrients_per_100g = NutrientProfile(
+            calories=_safe_float(nutrients_raw.get("calories")),
+            protein_g=_safe_float(nutrients_raw.get("protein_g")),
+            fat_g=_safe_float(nutrients_raw.get("fat_g")),
+            carbs_g=_safe_float(nutrients_raw.get("carbs_g")),
+            fiber_g=_safe_float(nutrients_raw.get("fiber_g")),
+            sugar_g=_safe_float(nutrients_raw.get("sugar_g")),
+            sodium_mg=_safe_float(nutrients_raw.get("sodium_mg")),
+            saturated_fat_g=_safe_float(nutrients_raw.get("saturated_fat_g")),
+        )
+
+        if not product_name or nutrients_per_100g.calories <= 0:
+            return MealEstimate(
+                warnings=[
+                    "I couldn't read the calorie information from that label. "
+                    "Try a closer, straight-on photo — or send a photo of the "
+                    "food itself and I'll estimate it visually."
+                ],
+                needs_label_photo_for_barcode=barcode,
+            )
+
+        serving_size_label = (data.get("serving_size_label") or "").strip()
+        serving_quantity_g = _safe_float(data.get("serving_quantity_g")) or None
+
+        # Build a single ItemEstimate for the serving. Prefer the label's
+        # declared serving weight; fall back to 100 g with a warning.
+        warnings: list[str] = []
+        if serving_quantity_g and serving_quantity_g > 0:
+            weight_g = serving_quantity_g
+            scale = weight_g / 100.0
+            serving_display = serving_size_label or f"{weight_g:.0f} g"
+        else:
+            weight_g = 100.0
+            scale = 1.0
+            serving_display = serving_size_label or "100 g"
+            warnings.append(
+                "Couldn't read the serving size from the label — showing "
+                "nutrition per 100 g. Adjust the amount if you ate a different "
+                "quantity."
+            )
+
+        nutrients_serving = nutrients_per_100g.scale(scale)
+
+        item = ItemEstimate(
+            name=product_name,
+            weight_g=round(weight_g, 0),
+            nutrients=nutrients_serving,
+            confidence=max(0.0, min(1.0, extraction_conf or 0.75)),
+            source="label_ocr",
+            barcode=barcode,
+            serving_size_label=serving_display,
+            notes=(data.get("notes") or "").strip(),
+        )
+
+        contribution = OFFContribution(
+            barcode=barcode,
+            product_name=product_name,
+            brand=(data.get("brand") or "").strip(),
+            serving_size_label=serving_size_label,
+            serving_quantity_g=serving_quantity_g,
+            nutrients_per_100g=nutrients_per_100g,
+            extraction_confidence=extraction_conf,
+        )
+
+        return MealEstimate(
+            items=[item],
+            total=nutrients_serving,
+            total_with_hidden=nutrients_serving,
+            overall_confidence=item.confidence,
+            warnings=warnings,
+            pending_off_contribution=(
+                contribution if contribution.is_submittable() else None
+            ),
+        )
+
+    async def submit_pending_contribution(
+        self, contribution: OFFContribution
+    ) -> bool:
+        """Submit a user-confirmed contribution to Open Food Facts.
+
+        Thin wrapper around ``OpenFoodFactsClient.submit`` so callers don't
+        need to reach into ``self.off`` directly.
+        """
+        return await self.off.submit(contribution)
 
     # ─────────────────────────────────────────────────────────
     # Stage 1: Visual Analysis
@@ -781,6 +974,70 @@ def _detect_media_type(image_bytes: bytes) -> str:
     if image_bytes[:6] in (b"GIF87a", b"GIF89a"):
         return "image/gif"
     return "image/jpeg"  # default fallback
+
+
+def _safe_float(value) -> float:
+    """Coerce JSON values to a float, treating ``None`` / strings as 0."""
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _meal_from_off_product(product: OpenFoodFactsProduct) -> MealEstimate:
+    """Build a complete MealEstimate from an Open Food Facts product hit.
+
+    Uses the package serving when OFF provides one, otherwise falls back
+    to per-100 g with a warning so the user knows to adjust.
+    """
+    warnings: list[str] = []
+    if product.serving_quantity_g and product.serving_quantity_g > 0:
+        weight_g = product.serving_quantity_g
+        scale = weight_g / 100.0
+        serving_display = (
+            product.serving_size_label or f"{weight_g:.0f} g"
+        )
+    else:
+        weight_g = 100.0
+        scale = 1.0
+        serving_display = product.serving_size_label or "100 g"
+        warnings.append(
+            "No serving size on this product in Open Food Facts — showing "
+            "nutrition per 100 g. Adjust the amount if you ate a different "
+            "quantity."
+        )
+
+    nutrients = product.nutrients_per_100g.scale(scale)
+
+    display_name = product.product_name
+    if product.brand:
+        display_name = f"{product.brand} — {product.product_name}"
+
+    item = ItemEstimate(
+        name=display_name,
+        weight_g=round(weight_g, 0),
+        nutrients=nutrients,
+        confidence=0.9,
+        source="barcode",
+        barcode=product.barcode,
+        serving_size_label=serving_display,
+    )
+
+    if product.data_quality_warnings:
+        warnings.append(
+            "Open Food Facts flagged data quality issues on this product "
+            "— numbers may be off."
+        )
+
+    return MealEstimate(
+        items=[item],
+        total=nutrients,
+        total_with_hidden=nutrients,
+        overall_confidence=item.confidence,
+        warnings=warnings,
+    )
 
 
 def _parse_json(text: str) -> dict:

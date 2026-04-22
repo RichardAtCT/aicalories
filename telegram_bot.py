@@ -30,7 +30,7 @@ from telegram.ext import (
     filters,
 )
 
-from calorie_estimator import CalorieEstimator
+from calorie_estimator import CalorieEstimator, OFFContribution
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -45,6 +45,17 @@ estimator = CalorieEstimator(
     estimate_hidden_cals=True,
     include_confidence_ranges=True,
 )
+
+# ── Per-chat barcode state ───────────────────────────────────
+#
+# When a user sends a packaged-food photo whose barcode isn't in Open
+# Food Facts, the estimator asks them to re-send the nutrition label.
+# We stash the failed barcode here so the next photo from that chat is
+# routed through the label-OCR path. After reading the label we also
+# stash the extracted OFFContribution so the user can reply "yes" to
+# contribute it back to OFF.
+pending_barcodes: dict[int, str] = {}
+pending_contributions: dict[int, OFFContribution] = {}
 
 
 # ── Handlers ─────────────────────────────────────────────────
@@ -93,6 +104,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Send "analyzing" indicator
     await update.message.reply_chat_action("typing")
 
+    chat_id = update.effective_chat.id
+
     # Get the largest available photo
     photo = update.message.photo[-1]
     file = await photo.get_file()
@@ -104,14 +117,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Get caption as the text description
     description = update.message.caption or None
 
+    # If the last turn asked for a nutrition-label re-shoot, route this
+    # photo through the label-OCR path instead of the visual pipeline.
+    barcode_hint = pending_barcodes.pop(chat_id, None)
+
     try:
-        # Run the estimation pipeline
         result = await estimator.estimate(
             image=image_bytes,
             description=description,
+            barcode_hint=barcode_hint,
         )
 
-        # Format and send the response
+        # Stash any new state for the next turn.
+        if result.needs_label_photo_for_barcode:
+            pending_barcodes[chat_id] = result.needs_label_photo_for_barcode
+            pending_contributions.pop(chat_id, None)
+        if result.pending_off_contribution is not None:
+            pending_contributions[chat_id] = result.pending_off_contribution
+        else:
+            # A successful non-label estimate clears any stale contribution.
+            if not result.needs_label_photo_for_barcode:
+                pending_contributions.pop(chat_id, None)
+
         summary = result.format_summary()
 
         # Telegram has a 4096 char limit — truncate if needed
@@ -131,7 +158,44 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages without a photo."""
+    """Handle text messages without a photo.
+
+    Also handles the "yes" confirmation for contributing a freshly-read
+    nutrition label back to Open Food Facts.
+    """
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip().lower()
+    contribution = pending_contributions.get(chat_id)
+
+    if contribution is not None and text in {"yes", "y", "ok", "sure", "👍"}:
+        await update.message.reply_chat_action("typing")
+        try:
+            submitted = await estimator.submit_pending_contribution(contribution)
+        except Exception as e:
+            logger.error(f"OFF submit raised: {e}", exc_info=True)
+            submitted = False
+
+        pending_contributions.pop(chat_id, None)
+
+        if submitted:
+            await update.message.reply_text(
+                f"✅ Added *{contribution.product_name}* (barcode "
+                f"`{contribution.barcode}`) to Open Food Facts. "
+                "Thanks for helping others!",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "Sorry, I couldn't submit that to Open Food Facts. "
+                "The nutrition data is still in your meal estimate above.",
+            )
+        return
+
+    if contribution is not None and text in {"no", "n", "skip", "cancel"}:
+        pending_contributions.pop(chat_id, None)
+        await update.message.reply_text("No problem — nothing sent to Open Food Facts.")
+        return
+
     await update.message.reply_text(
         "Please send a *photo* of your food and I'll estimate the calories.\n\n"
         "You can add a caption to the photo for better accuracy, "

@@ -19,9 +19,12 @@ from .models import (
     MealEstimate,
     NutrientProfile,
     NutrientRange,
+    OFFContribution,
+    OpenFoodFactsProduct,
     USDACandidate,
     VisualAnalysis,
 )
+from .openfoodfacts import OpenFoodFactsClient
 
 __all__ = [
     "CalorieEstimator",
@@ -32,6 +35,9 @@ __all__ = [
     "MealEstimate",
     "NutrientProfile",
     "NutrientRange",
+    "OFFContribution",
+    "OpenFoodFactsClient",
+    "OpenFoodFactsProduct",
     "USDACandidate",
     "VisualAnalysis",
 ]

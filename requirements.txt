@@ -6,5 +6,12 @@ pydantic>=2.0
 # OpenAI / Codex provider
 openai>=1.0
 
+# Barcode scanning for packaged foods (stage 0 → Open Food Facts)
+# Requires the zbar C library at runtime:
+#   Debian/Ubuntu: apt-get install libzbar0
+#   macOS:         brew install zbar
+pyzbar>=0.1.9
+pillow>=10.0
+
 # Optional: Telegram bot
 # python-telegram-bot>=21.0

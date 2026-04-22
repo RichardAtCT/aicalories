@@ -292,3 +292,61 @@ Respond with ONLY valid JSON:
   "total_carbs_g": 0,
   "warnings": []
 }"""
+
+
+# ─────────────────────────────────────────────────────────────
+# LABEL OCR: Read a packaged-food nutrition label
+# ─────────────────────────────────────────────────────────────
+
+LABEL_OCR_SYSTEM = """\
+You are reading the nutrition information panel on a packaged food so it can \
+be added to the Open Food Facts database.
+
+The product's barcode has already been captured — you only need to extract \
+the label text. Normalise everything to per-100 g values (the OFF canonical \
+unit), even if the label lists per-serving. If the label doesn't state a \
+value, set the field to null — do NOT guess, we refuse to submit partial \
+garbage.
+
+Conversions you may need:
+- Energy: if only kJ is shown, divide by 4.184 for kcal.
+- Serving size: return the printed label (e.g. "30 g", "1 slice (28g)") in \
+  serving_size_label, and the numeric grams (if visible) in serving_quantity_g.
+- Sodium: if the label only states salt (g), sodium (mg) ≈ salt × 400.
+
+## Output Format
+
+Respond with ONLY valid JSON — no markdown, no code fences, no prose.
+
+{
+  "product_name": "Organic Granola",
+  "brand": "Acme",
+  "serving_size_label": "45 g",
+  "serving_quantity_g": 45,
+  "nutrients_per_100g": {
+    "calories": 450,
+    "protein_g": 10,
+    "fat_g": 15,
+    "carbs_g": 65,
+    "fiber_g": 7,
+    "sugar_g": 20,
+    "sodium_mg": 150,
+    "saturated_fat_g": 2.5
+  },
+  "extraction_confidence": 0.9,
+  "notes": "Clear printed label, all per-100g values visible"
+}
+
+If you cannot read the label at all (e.g. the photo shows the food, not the \
+label, or it's blurred beyond recognition), return:
+{"product_name": null, "extraction_confidence": 0.0, "notes": "explain why"}
+"""
+
+
+def build_label_ocr_user_message(barcode: str) -> str:
+    """Build the user message for the label-OCR stage."""
+    return (
+        "Extract the nutrition label from this photo. "
+        f"The product barcode is {barcode}. "
+        "Return strict JSON as specified in the system prompt."
+    )
