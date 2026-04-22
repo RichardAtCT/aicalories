@@ -144,8 +144,16 @@ pip install -r requirements.txt
 #   macOS:          brew install zbar
 ```
 
-If zbar isn't installed the estimator still works — it just skips the barcode
-stage and goes straight to visual analysis.
+On some macOS setups, `pyzbar` also needs the Homebrew library path exposed at
+runtime so it can find `libzbar`:
+
+```bash
+export DYLD_LIBRARY_PATH=/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}
+```
+
+If zbar isn't installed — or `pyzbar` can't find the shared library — the
+estimator still works; it just skips the barcode stage and goes straight to
+visual analysis.
 
 ### Configuration
 
