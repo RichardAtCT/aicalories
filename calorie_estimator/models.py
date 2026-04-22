@@ -128,8 +128,22 @@ class OpenFoodFactsProduct(BaseModel):
     data_quality_warnings: list[str] = Field(default_factory=list)
 
     def has_usable_nutrition(self) -> bool:
-        """OFF products are only useful if we have at least an energy value."""
-        return self.nutrients_per_100g.calories > 0
+        """Guard against partial OFF records short-circuiting the pipeline.
+
+        An OFF product is only authoritative when both the energy value and
+        the main macros (protein / fat / carbs) are present. A hit with only
+        ``energy-kcal_100g`` populated would otherwise render as a
+        high-confidence packaged-food result with zero macros — worse than
+        falling back to the vision pipeline or a label re-shoot.
+        """
+        n = self.nutrients_per_100g
+        if n.calories <= 0:
+            return False
+        # For any real food with calories > 0, at least one of protein, fat,
+        # or carbs must be non-zero by basic energy accounting. If all three
+        # are zero the OFF record is missing macros rather than reporting
+        # them as zero, so we decline the shortcut.
+        return (n.protein_g + n.fat_g + n.carbs_g) > 0
 
 
 class OFFContribution(BaseModel):
