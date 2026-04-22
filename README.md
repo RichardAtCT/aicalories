@@ -9,12 +9,18 @@ A self-contained Python tool that estimates calories and macronutrients from foo
 ```
 Agent (Telegram bot, etc.)
   │
-  │  estimate(image_bytes, text_description?)
+  │  estimate(image_bytes, text_description?, barcode_hint?)
   │
   ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  CalorieEstimator                                               │
 │                                                                 │
+│  Stage 0: BARCODE ──────────────────────────── (pyzbar + OFF)   │
+│  │  Detect UPC/EAN → look up Open Food Facts                    │
+│  │  • Hit with nutrition  → return immediately                   │
+│  │  • Hit without data    → ask user for nutrition-label photo  │
+│  │  • No barcode          → fall through to Stage 1             │
+│  ▼                                                              │
 │  Stage 1: VISUAL ANALYSIS ──────────────────── (LLM + vision)  │
 │  │  Identify foods, cooking methods, reference objects          │
 │  │  Estimate dimensions and weight in grams                     │
@@ -40,6 +46,24 @@ Agent (Telegram bot, etc.)
   ▼
 Agent formats response for user
 ```
+
+### Packaged foods (barcode path)
+
+If a UPC/EAN is visible in the photo, Stage 0 decodes it with `pyzbar` and
+looks the product up in [Open Food Facts](https://world.openfoodfacts.org).
+When OFF has full nutrition data we skip the LLM entirely and return a
+high-confidence result built from the package's own values, annotated with
+the serving size so you can adjust the amount if you ate more or less.
+
+If the barcode isn't in OFF — or the product has no nutrition data — the
+estimate comes back with a warning asking the user to photograph the
+nutrition label (or the food itself). On the follow-up photo, pass the
+stored barcode as `barcode_hint=...` to `estimate()`; the library reads the
+label, returns a single-item `MealEstimate`, and attaches a
+`pending_off_contribution`. After the user confirms, call
+`estimator.submit_pending_contribution(...)` to push the data back to OFF
+so the next person scanning that product gets it for free. The library
+never submits on its own.
 
 ### Why this architecture?
 
@@ -114,7 +138,22 @@ pydantic >= 2.0        # data models
 
 ```bash
 pip install -r requirements.txt
+
+# Barcode scanning requires the zbar system library:
+#   Debian/Ubuntu:  sudo apt-get install libzbar0
+#   macOS:          brew install zbar
 ```
+
+On some macOS setups, `pyzbar` also needs the Homebrew library path exposed at
+runtime so it can find `libzbar`:
+
+```bash
+export DYLD_LIBRARY_PATH=/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}
+```
+
+If zbar isn't installed — or `pyzbar` can't find the shared library — the
+estimator still works; it just skips the barcode stage and goes straight to
+visual analysis.
 
 ### Configuration
 
@@ -127,6 +166,14 @@ export USDA_API_KEY="your-usda-key"         # free at https://fdc.nal.usda.gov/a
 
 # Optional
 export CALORIE_ESTIMATOR_MODEL="claude-sonnet-4-20250514"  # default
+
+# Optional — attribute Open Food Facts contributions to a real account
+# (anonymous edits work without these, logged against your IP).
+export OFF_USERNAME="your-off-user"
+export OFF_PASSWORD="your-off-password"
+# Optional — point at the OFF staging server when testing submissions
+# so you don't pollute production data.
+export OFF_BASE_URL="https://world.openfoodfacts.net"
 ```
 
 Get a free USDA API key at: https://fdc.nal.usda.gov/api-key-signup
