@@ -28,6 +28,25 @@ import urllib.request
 from pathlib import Path
 
 
+def _configure_macos_zbar_path() -> None:
+    """Help pyzbar find Homebrew's libzbar on macOS without manual exports.
+
+    On some Apple Silicon/Homebrew setups, pyzbar fails with
+    "Unable to find zbar shared library" unless /opt/homebrew/lib is present in
+    DYLD_LIBRARY_PATH. Apply that automatically when safe so barcode scans work
+    out of the box.
+    """
+    if sys.platform != "darwin":
+        return
+    homebrew_lib = "/opt/homebrew/lib"
+    if not Path(homebrew_lib).exists():
+        return
+    current = os.environ.get("DYLD_LIBRARY_PATH", "")
+    parts = [p for p in current.split(":") if p]
+    if homebrew_lib not in parts:
+        os.environ["DYLD_LIBRARY_PATH"] = ":".join([homebrew_lib, *parts]) if parts else homebrew_lib
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Estimate calories and macronutrients from a food photo.",
@@ -83,6 +102,7 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main() -> None:
+    _configure_macos_zbar_path()
     args = parse_args()
 
     # ── Resolve image to bytes ─────────────────────────────────────────────────
