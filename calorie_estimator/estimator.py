@@ -6,7 +6,7 @@ Runs the 4-stage pipeline:
   Stage 3: Disambiguation (LLM, 2nd pass)
   Stage 4: Deterministic calculation
 
-Supports OpenAI Codex (default), Anthropic, and OpenAI as LLM providers.
+Supports Claude Code CLI (default, OAuth-backed), OpenAI Codex, Anthropic, and OpenAI as LLM providers.
 Falls back to a single-pass estimation if the USDA API is unavailable.
 """
 
@@ -68,7 +68,9 @@ class CalorieEstimator:
 
     def __init__(
         self,
-        provider: Literal["anthropic", "openai", "openai-codex"] = "openai-codex",
+        provider: Literal[
+            "anthropic", "openai", "openai-codex", "claude-code"
+        ] = "claude-code",
         model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
@@ -108,6 +110,12 @@ class CalorieEstimator:
                 or os.environ.get("CODEX_ACCESS_TOKEN", "")
                 or self._read_codex_access_token()
             )
+        elif provider == "claude-code":
+            self.model = model or os.environ.get(
+                "CALORIE_ESTIMATOR_MODEL", "claude-haiku-4-5"
+            )
+            # OAuth is handled by the `claude` CLI subprocess the SDK spawns.
+            self.api_key = ""
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
@@ -783,6 +791,10 @@ class CalorieEstimator:
             return await self._call_openai_codex(
                 system, user_text, image_b64, media_type
             )
+        elif self.provider == "claude-code":
+            return await self._call_claude_code(
+                system, user_text, image_b64, media_type
+            )
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
 
@@ -883,6 +895,61 @@ class CalorieEstimator:
         )
 
         return message.content[0].text
+
+    async def _call_claude_code(
+        self,
+        system: str,
+        user_text: str,
+        image_b64: str | None,
+        media_type: str | None,
+    ) -> str:
+        """Call Claude via the Claude Code CLI (OAuth from `claude /login`).
+
+        Routes the request through claude-agent-sdk's streaming-input
+        ``query`` so we can attach an image content block. No API key is
+        consumed — auth runs through the spawned ``claude`` subprocess and
+        bills against the user's Claude Code subscription.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ClaudeAgentOptions,
+            TextBlock,
+            query,
+        )
+
+        content: list[dict] = []
+        if image_b64 and media_type:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": image_b64,
+                    },
+                }
+            )
+        content.append({"type": "text", "text": user_text})
+
+        async def _prompt_stream():
+            yield {
+                "type": "user",
+                "message": {"role": "user", "content": content},
+            }
+
+        options = ClaudeAgentOptions(
+            system_prompt=system,
+            model=self.model,
+            max_turns=1,
+        )
+
+        reply_parts: list[str] = []
+        async for message in query(prompt=_prompt_stream(), options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        reply_parts.append(block.text)
+        return "".join(reply_parts).strip()
 
     async def _call_openai(
         self,
