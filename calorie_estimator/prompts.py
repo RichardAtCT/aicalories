@@ -118,10 +118,13 @@ explanation, no code fences.
 
 def build_stage_1_user_message(user_description: str | None = None) -> str:
     """Build the user message for Stage 1, incorporating optional text."""
-    parts = ["Analyse this food image and estimate the nutritional content of each item."]
+    parts = [
+        "Analyse this food image and estimate the nutritional content of each item."
+    ]
 
     if user_description:
-        parts.append(f"""
+        parts.append(
+            f"""
 Additional context from the user:
 \"{user_description}\"
 
@@ -129,7 +132,8 @@ Use this to:
 - Resolve any ambiguity in food identification
 - Adjust cooking method assumptions (e.g., "cooked in butter" or "sugar-free")
 - Account for hidden ingredients the camera cannot see
-- Correct portion size context (e.g., "this is a kids' portion" or "I ate half")""")
+- Correct portion size context (e.g., "this is a kids' portion" or "I ate half")"""
+        )
 
     return "\n".join(parts)
 
@@ -207,8 +211,10 @@ def build_stage_3_user_message(
         parts.append(f'User description: "{user_description}"\n')
 
     for item in items_with_candidates:
-        parts.append(f"### Item {item['item_id']}: {item['item_name']} "
-                      f"(estimated {item['estimated_weight_g']:.0f}g)")
+        parts.append(
+            f"### Item {item['item_id']}: {item['item_name']} "
+            f"(estimated {item['estimated_weight_g']:.0f}g)"
+        )
         parts.append(f"Cooking method: {item.get('cooking_method', 'unknown')}")
         parts.append(f"State: {item.get('state', 'cooked')}")
         if item.get("visible_additions"):
@@ -226,11 +232,84 @@ def build_stage_3_user_message(
                 serving += f", {c['calories_per_100g']:.0f} kcal/100g)"
             else:
                 serving = f" ({c['calories_per_100g']:.0f} kcal/100g)"
-            parts.append(f"  {label}) fdc_id: {c['fdc_id']} — \"{c['description']}\"{serving}")
+            parts.append(
+                f"  {label}) fdc_id: {c['fdc_id']} — \"{c['description']}\"{serving}"
+            )
 
         parts.append("")
 
     return "\n".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────
+# TEXT EXTRACTION: Stage 1 alternative when there is no image
+# ─────────────────────────────────────────────────────────────
+
+TEXT_EXTRACTION_SYSTEM = """\
+You extract structured food items from a plain-text meal description so they \
+can be looked up in a nutrition database.
+
+The user has typed (not photographed) what they ate, e.g. \
+"two slices of pepperoni pizza" or "a chicken caesar salad with dressing". \
+Convert that into the same structured shape we would have produced from a \
+photo, so the rest of the pipeline can run unchanged.
+
+## Process
+
+1. Identify each distinct food item the user mentioned.
+2. For each item, infer the most likely cooking method and state from \
+context (pizza is baked; "fried egg" is fried; default to "cooked").
+3. Estimate weight in grams using these reference portions:
+   - 1 slice pizza ≈ 100g · 1 slice bread ≈ 30g · 1 large egg ≈ 50g
+   - 1 medium chicken breast ≈ 165g · 1 medium banana ≈ 118g
+   - 1 cup cooked rice ≈ 158g · 1 cup cooked pasta ≈ 140g
+   - 1 cup salad greens ≈ 30g · 1 tbsp oil/dressing ≈ 14g
+   - "small portion" → 0.7×, "large portion" → 1.4×, "side" → 0.5×
+4. Set BOTH confidence_identification and confidence_portion to a value that \
+reflects how specific the description is. Vague ("some chicken") → 0.4. \
+Specific ("two slices of pepperoni pizza") → 0.85.
+5. Leave dimensions_cm and estimated_volume_ml as zeros — they are not \
+meaningful for text input.
+
+## Output Format
+
+Respond with ONLY valid JSON in the same shape as the visual analysis. No \
+markdown, no explanation, no code fences.
+
+{
+  "scene": {
+    "reference_objects": [],
+    "lighting_quality": "good",
+    "image_quality": "good",
+    "notes": "text-only input"
+  },
+  "items": [
+    {
+      "id": 1,
+      "name": "pepperoni pizza slice",
+      "cooking_method": "baked",
+      "state": "cooked",
+      "visible_additions": [],
+      "category": "mixed_dishes",
+      "dimensions_cm": {"length_cm": 0, "width_cm": 0, "height_cm": 0},
+      "estimated_volume_ml": 0,
+      "estimated_weight_g": 200,
+      "portion_description": "two slices",
+      "confidence_identification": 0.85,
+      "confidence_portion": 0.7,
+      "ambiguity_notes": ""
+    }
+  ],
+  "meal_context": "user-described meal"
+}"""
+
+
+def build_text_extraction_user_message(description: str) -> str:
+    """Build the user message for the text-only Stage 1 alternative."""
+    return (
+        "Extract structured food items from this meal description:\n\n"
+        f'"{description}"'
+    )
 
 
 # ─────────────────────────────────────────────────────────────

@@ -46,9 +46,11 @@ from .prompts import (
     LABEL_OCR_SYSTEM,
     STAGE_1_SYSTEM,
     STAGE_3_SYSTEM,
+    TEXT_EXTRACTION_SYSTEM,
     build_label_ocr_user_message,
     build_stage_1_user_message,
     build_stage_3_user_message,
+    build_text_extraction_user_message,
 )
 from .usda import USDAClient
 
@@ -92,14 +94,10 @@ class CalorieEstimator:
             )
             self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         elif provider == "openai":
-            self.model = model or os.environ.get(
-                "CALORIE_ESTIMATOR_MODEL", "gpt-4o"
-            )
+            self.model = model or os.environ.get("CALORIE_ESTIMATOR_MODEL", "gpt-4o")
             self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         elif provider == "openai-codex":
-            self.model = model or os.environ.get(
-                "CALORIE_ESTIMATOR_MODEL", "gpt-5.4"
-            )
+            self.model = model or os.environ.get("CALORIE_ESTIMATOR_MODEL", "gpt-5.4")
             self.base_url = (
                 base_url
                 or os.environ.get("CALORIE_ESTIMATOR_BASE_URL")
@@ -169,8 +167,7 @@ class CalorieEstimator:
 
         # Check if we got any candidates at all
         has_candidates = any(
-            len(ic.get("candidates", [])) > 0
-            for ic in items_with_candidates
+            len(ic.get("candidates", [])) > 0 for ic in items_with_candidates
         )
 
         if has_candidates:
@@ -189,6 +186,71 @@ class CalorieEstimator:
             # Fallback: use Stage 1 estimates directly with fallback nutrition values
             logger.warning("No USDA candidates found; using fallback estimation")
             return await self._fallback_estimate(image_b64, media_type, description)
+
+    async def estimate_from_text(self, description: str) -> MealEstimate:
+        """Run the pipeline from a plain-text description (no image).
+
+        A text-only Stage 1 LLM call extracts structured ``FoodItem`` entries
+        from the description, then the existing Stage 2 (USDA lookup), Stage 3
+        (disambiguation, no image), and Stage 4 (deterministic calculation)
+        run unchanged.
+
+        Args:
+            description: Natural-language description of the meal,
+                e.g. "two slices of pepperoni pizza".
+
+        Returns:
+            MealEstimate with per-item breakdown and totals. Empty with a
+            warning when the description is too vague or has no USDA matches.
+        """
+        logger.info("Stage 1 (text): extraction")
+        analysis = await self._stage_1_extract_from_text(description)
+
+        if not analysis.items:
+            return MealEstimate(
+                warnings=[
+                    "Couldn't pick out any food items from the description. "
+                    "Try being more specific about what you ate."
+                ],
+            )
+
+        logger.info(f"Stage 2: USDA lookup for {len(analysis.items)} items")
+        items_with_candidates = await self._stage_2_lookup(analysis)
+
+        if not any(ic.get("candidates") for ic in items_with_candidates):
+            return MealEstimate(
+                warnings=[
+                    "No matching nutrition data found for the items described. "
+                    "Try more common food names."
+                ],
+                meal_context=analysis.meal_context,
+            )
+
+        logger.info("Stage 3 (text): disambiguation")
+        matches = await self._stage_3_disambiguate(
+            None, None, items_with_candidates, description
+        )
+
+        logger.info("Stage 4: calculation")
+        return self._stage_4_calculate(
+            matches, items_with_candidates, analysis, description
+        )
+
+    async def _stage_1_extract_from_text(self, description: str) -> VisualAnalysis:
+        """Text-only Stage 1: extract structured FoodItems from a description."""
+        response_text = await self._call_llm(
+            system=TEXT_EXTRACTION_SYSTEM,
+            user_text=build_text_extraction_user_message(description),
+        )
+
+        try:
+            data = _parse_json(response_text)
+            data = _normalize_enums(data)
+            return VisualAnalysis.model_validate(data)
+        except Exception as e:
+            logger.error(f"Failed to parse text-extraction output: {e}")
+            logger.debug(f"Raw output: {response_text[:500]}")
+            return VisualAnalysis()
 
     # ─────────────────────────────────────────────────────────
     # Stage 0: Barcode → Open Food Facts
@@ -350,9 +412,7 @@ class CalorieEstimator:
             ),
         )
 
-    async def submit_pending_contribution(
-        self, contribution: OFFContribution
-    ) -> bool:
+    async def submit_pending_contribution(self, contribution: OFFContribution) -> bool:
         """Submit a user-confirmed contribution to Open Food Facts.
 
         Thin wrapper around ``OpenFoodFactsClient.submit`` so callers don't
@@ -415,18 +475,20 @@ class CalorieEstimator:
             if not candidates:
                 candidates = await self.usda.search(item.name, max_results=5)
 
-            results.append({
-                "item_id": item.id,
-                "item_name": item.name,
-                "cooking_method": item.cooking_method,
-                "state": item.state,
-                "visible_additions": item.visible_additions,
-                "estimated_weight_g": item.estimated_weight_g,
-                "category": item.category,
-                "confidence_identification": item.confidence_identification,
-                "confidence_portion": item.confidence_portion,
-                "candidates": [c.model_dump() for c in candidates],
-            })
+            results.append(
+                {
+                    "item_id": item.id,
+                    "item_name": item.name,
+                    "cooking_method": item.cooking_method,
+                    "state": item.state,
+                    "visible_additions": item.visible_additions,
+                    "estimated_weight_g": item.estimated_weight_g,
+                    "category": item.category,
+                    "confidence_identification": item.confidence_identification,
+                    "confidence_portion": item.confidence_portion,
+                    "candidates": [c.model_dump() for c in candidates],
+                }
+            )
 
         return results
 
@@ -436,12 +498,17 @@ class CalorieEstimator:
 
     async def _stage_3_disambiguate(
         self,
-        image_b64: str,
-        media_type: str,
+        image_b64: str | None,
+        media_type: str | None,
         items_with_candidates: list[dict],
         description: str | None,
     ) -> list[FoodMatch]:
-        """Second LLM call to select best USDA match per item."""
+        """Second LLM call to select best USDA match per item.
+
+        ``image_b64`` / ``media_type`` may be None when called from the
+        text-only path (``estimate_from_text``); the LLM disambiguates from
+        the candidate descriptions alone in that case.
+        """
         user_text = build_stage_3_user_message(items_with_candidates, description)
 
         response_text = await self._call_llm(
@@ -471,18 +538,22 @@ class CalorieEstimator:
                     selected_desc = c["description"]
                     break
 
-            matches.append(FoodMatch(
-                item_id=item_id,
-                item_name=ic.get("item_name", ""),
-                selected_fdc_id=m.get("selected_fdc_id", 0),
-                selected_description=selected_desc,
-                reason=m.get("reason", ""),
-                adjusted_weight_g=m.get("adjusted_weight_g", ic.get("estimated_weight_g", 0)),
-                weight_adjustment_reason=m.get("weight_adjustment_reason", ""),
-                confidence_identification=ic.get("confidence_identification", 0.5),
-                confidence_portion=ic.get("confidence_portion", 0.5),
-                category=FoodCategory(ic.get("category", "other")),
-            ))
+            matches.append(
+                FoodMatch(
+                    item_id=item_id,
+                    item_name=ic.get("item_name", ""),
+                    selected_fdc_id=m.get("selected_fdc_id", 0),
+                    selected_description=selected_desc,
+                    reason=m.get("reason", ""),
+                    adjusted_weight_g=m.get(
+                        "adjusted_weight_g", ic.get("estimated_weight_g", 0)
+                    ),
+                    weight_adjustment_reason=m.get("weight_adjustment_reason", ""),
+                    confidence_identification=ic.get("confidence_identification", 0.5),
+                    confidence_portion=ic.get("confidence_portion", 0.5),
+                    category=FoodCategory(ic.get("category", "other")),
+                )
+            )
 
         return matches
 
@@ -545,16 +616,18 @@ class CalorieEstimator:
                     high=nutrients.scale(1 + margin),
                 )
 
-            items.append(ItemEstimate(
-                name=match.item_name,
-                weight_g=round(weight_g, 0),
-                nutrients=nutrients,
-                range=nutrient_range,
-                fdc_id=match.selected_fdc_id,
-                fdc_description=match.selected_description,
-                confidence=confidence,
-                category=match.category,
-            ))
+            items.append(
+                ItemEstimate(
+                    name=match.item_name,
+                    weight_g=round(weight_g, 0),
+                    nutrients=nutrients,
+                    range=nutrient_range,
+                    fdc_id=match.selected_fdc_id,
+                    fdc_description=match.selected_description,
+                    confidence=confidence,
+                    category=match.category,
+                )
+            )
 
             meal_total = meal_total + nutrients
 
@@ -566,8 +639,10 @@ class CalorieEstimator:
         total_with_hidden = NutrientProfile(
             calories=meal_total.calories + sum(h.estimated_calories for h in hidden),
             protein_g=meal_total.protein_g,
-            fat_g=meal_total.fat_g + sum(
-                h.estimated_calories / 9 for h in hidden  # rough: assume hidden cals are fat
+            fat_g=meal_total.fat_g
+            + sum(
+                h.estimated_calories / 9
+                for h in hidden  # rough: assume hidden cals are fat
             ),
             carbs_g=meal_total.carbs_g,
             fiber_g=meal_total.fiber_g,
@@ -581,7 +656,9 @@ class CalorieEstimator:
         low_conf_items = [i for i in items if i.confidence < 0.5]
         if low_conf_items:
             names = ", ".join(i.name for i in low_conf_items)
-            warnings.append(f"Low confidence for: {names}. Consider adding a text description.")
+            warnings.append(
+                f"Low confidence for: {names}. Consider adding a text description."
+            )
         if analysis.scene.image_quality == "poor":
             warnings.append("Image quality is poor — estimates may be less accurate.")
         if hidden:
@@ -641,13 +718,15 @@ class CalorieEstimator:
                 carbs_g=raw_item.get("carbs_g", 0),
                 fiber_g=raw_item.get("fiber_g", 0),
             )
-            items.append(ItemEstimate(
-                name=raw_item.get("name", "Unknown"),
-                weight_g=raw_item.get("weight_g", 0),
-                nutrients=nutrients,
-                confidence=raw_item.get("confidence", 0.4),
-                notes=raw_item.get("notes", ""),
-            ))
+            items.append(
+                ItemEstimate(
+                    name=raw_item.get("name", "Unknown"),
+                    weight_g=raw_item.get("weight_g", 0),
+                    nutrients=nutrients,
+                    confidence=raw_item.get("confidence", 0.4),
+                    notes=raw_item.get("notes", ""),
+                )
+            )
 
         meal_total = NutrientProfile()
         for item in items:
@@ -671,7 +750,9 @@ class CalorieEstimator:
         )
 
         warnings = data.get("warnings", [])
-        warnings.append("⚠️ USDA database unavailable — using LLM internal estimates (less accurate).")
+        warnings.append(
+            "⚠️ USDA database unavailable — using LLM internal estimates (less accurate)."
+        )
 
         return MealEstimate(
             items=items,
@@ -690,16 +771,18 @@ class CalorieEstimator:
         self,
         system: str,
         user_text: str,
-        image_b64: str,
-        media_type: str,
+        image_b64: str | None = None,
+        media_type: str | None = None,
     ) -> str:
-        """Call the vision LLM and return the text response."""
+        """Call the LLM and return the text response. Image is optional."""
         if self.provider == "anthropic":
             return await self._call_anthropic(system, user_text, image_b64, media_type)
         elif self.provider == "openai":
             return await self._call_openai(system, user_text, image_b64, media_type)
         elif self.provider == "openai-codex":
-            return await self._call_openai_codex(system, user_text, image_b64, media_type)
+            return await self._call_openai_codex(
+                system, user_text, image_b64, media_type
+            )
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
 
@@ -756,7 +839,9 @@ class CalorieEstimator:
             if len(parts) >= 2:
                 payload = parts[1] + "=" * (-len(parts[1]) % 4)
                 claims = json.loads(base64.urlsafe_b64decode(payload))
-                acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+                acct_id = claims.get("https://api.openai.com/auth", {}).get(
+                    "chatgpt_account_id"
+                )
                 if isinstance(acct_id, str) and acct_id:
                     headers["ChatGPT-Account-ID"] = acct_id
         except Exception:
@@ -767,38 +852,34 @@ class CalorieEstimator:
         self,
         system: str,
         user_text: str,
-        image_b64: str,
-        media_type: str,
+        image_b64: str | None,
+        media_type: str | None,
     ) -> str:
-        """Call Anthropic's Messages API with vision."""
+        """Call Anthropic's Messages API. Image is optional."""
         import anthropic
 
         client = anthropic.AsyncAnthropic(api_key=self.api_key)
+
+        content: list[dict] = []
+        if image_b64 and media_type:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": image_b64,
+                    },
+                }
+            )
+        content.append({"type": "text", "text": user_text})
 
         message = await client.messages.create(
             model=self.model,
             max_tokens=4096,
             temperature=self.temperature,
             system=system,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": user_text,
-                        },
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
         )
 
         return message.content[0].text
@@ -807,10 +888,10 @@ class CalorieEstimator:
         self,
         system: str,
         user_text: str,
-        image_b64: str,
-        media_type: str,
+        image_b64: str | None,
+        media_type: str | None,
     ) -> str:
-        """Call OpenAI's Chat Completions API with vision."""
+        """Call OpenAI's Chat Completions API. Image is optional."""
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(
@@ -818,25 +899,26 @@ class CalorieEstimator:
             **({"base_url": self.base_url} if self.base_url else {}),
         )
 
+        user_content: list[dict] = []
+        if image_b64 and media_type:
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media_type};base64,{image_b64}",
+                        "detail": "high",
+                    },
+                }
+            )
+        user_content.append({"type": "text", "text": user_text})
+
         response = await client.chat.completions.create(
             model=self.model,
             temperature=self.temperature,
             max_tokens=4096,
             messages=[
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{image_b64}",
-                                "detail": "high",
-                            },
-                        },
-                        {"type": "text", "text": user_text},
-                    ],
-                },
+                {"role": "user", "content": user_content},
             ],
         )
 
@@ -846,10 +928,10 @@ class CalorieEstimator:
         self,
         system: str,
         user_text: str,
-        image_b64: str,
-        media_type: str,
+        image_b64: str | None,
+        media_type: str | None,
     ) -> str:
-        """Call ChatGPT Codex Responses API with vision without blocking the event loop."""
+        """Call ChatGPT Codex Responses API without blocking the event loop. Image is optional."""
         return await asyncio.to_thread(
             self._call_openai_codex_sync,
             system,
@@ -862,8 +944,8 @@ class CalorieEstimator:
         self,
         system: str,
         user_text: str,
-        image_b64: str,
-        media_type: str,
+        image_b64: str | None,
+        media_type: str | None,
     ) -> str:
         """Synchronous Codex call, executed in a worker thread by async callers."""
         from openai import OpenAI
@@ -874,23 +956,22 @@ class CalorieEstimator:
             default_headers=self._codex_cloudflare_headers(self.api_key),
         )
 
+        user_content: list[dict] = []
+        if image_b64 and media_type:
+            user_content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{media_type};base64,{image_b64}",
+                    "detail": "high",
+                }
+            )
+        user_content.append({"type": "input_text", "text": user_text})
+
         with client.responses.stream(
             model=self.model,
             store=False,
             instructions=system,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:{media_type};base64,{image_b64}",
-                            "detail": "high",
-                        },
-                        {"type": "input_text", "text": user_text},
-                    ],
-                }
-            ],
+            input=[{"role": "user", "content": user_content}],
         ) as stream:
             text_parts: list[str] = []
             for event in stream:
@@ -996,9 +1077,7 @@ def _meal_from_off_product(product: OpenFoodFactsProduct) -> MealEstimate:
     if product.serving_quantity_g and product.serving_quantity_g > 0:
         weight_g = product.serving_quantity_g
         scale = weight_g / 100.0
-        serving_display = (
-            product.serving_size_label or f"{weight_g:.0f} g"
-        )
+        serving_display = product.serving_size_label or f"{weight_g:.0f} g"
     else:
         weight_g = 100.0
         scale = 1.0
