@@ -10,7 +10,7 @@ Usage:
     print(result.total.calories)
 """
 
-from .estimator import CalorieEstimator
+from .estimator import CalorieEstimator, EstimatorTransientError
 from .models import (
     FoodCategory,
     FoodItem,
@@ -28,6 +28,7 @@ from .openfoodfacts import OpenFoodFactsClient
 
 __all__ = [
     "CalorieEstimator",
+    "EstimatorTransientError",
     "FoodCategory",
     "FoodItem",
     "HiddenCalorieEstimate",

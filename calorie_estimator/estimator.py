@@ -57,6 +57,15 @@ from .usda import USDAClient
 logger = logging.getLogger(__name__)
 
 
+class EstimatorTransientError(RuntimeError):
+    """A pipeline stage failed in a way that is likely to succeed on retry.
+
+    Raised when a same-call retry has already been attempted and still failed —
+    callers should decide whether to surface this to the user or retry again
+    at a higher level.
+    """
+
+
 class CalorieEstimator:
     """Estimates calories and macronutrients from food photos.
 
@@ -519,19 +528,38 @@ class CalorieEstimator:
         """
         user_text = build_stage_3_user_message(items_with_candidates, description)
 
-        response_text = await self._call_llm(
-            system=STAGE_3_SYSTEM,
-            user_text=user_text,
-            image_b64=image_b64,
-            media_type=media_type,
-        )
+        matches_raw: list[dict] | None = None
+        for attempt in (1, 2):
+            # On retry, prepend a stricter reminder — the common failure mode
+            # is the LLM appending prose after the JSON object.
+            prompt_text = (
+                user_text
+                if attempt == 1
+                else (
+                    "REMINDER: respond with raw JSON only. No prose, no markdown, "
+                    "no code fences, nothing after the closing brace.\n\n" + user_text
+                )
+            )
+            response_text = await self._call_llm(
+                system=STAGE_3_SYSTEM,
+                user_text=prompt_text,
+                image_b64=image_b64,
+                media_type=media_type,
+            )
+            try:
+                data = _parse_json(response_text)
+                matches_raw = data.get("matches", [])
+                break
+            except Exception as e:
+                logger.error(
+                    "Failed to parse Stage 3 output (attempt %d): %s", attempt, e
+                )
+                logger.debug("Raw Stage 3 output: %s", response_text[:500])
 
-        try:
-            data = _parse_json(response_text)
-            matches_raw = data.get("matches", [])
-        except Exception as e:
-            logger.error(f"Failed to parse Stage 3 output: {e}")
-            matches_raw = []
+        if matches_raw is None:
+            raise EstimatorTransientError(
+                "Stage 3 LLM output failed to parse as JSON twice in a row"
+            )
 
         # Build FoodMatch objects, merging in confidence and category from Stage 1
         item_lookup = {ic["item_id"]: ic for ic in items_with_candidates}
@@ -1187,15 +1215,18 @@ def _meal_from_off_product(product: OpenFoodFactsProduct) -> MealEstimate:
 
 
 def _parse_json(text: str) -> dict:
-    """Parse JSON from LLM output, handling markdown code fences."""
+    """Parse JSON from LLM output, tolerating markdown fences, prose prefixes,
+    and trailing commentary after the first complete JSON value."""
     text = text.strip()
-    # Strip markdown code fences if present
     if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove first line (```json) and last line (```)
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
         text = "\n".join(lines).strip()
-    return json.loads(text)
+    # Skip any prose before the first `{` or `[`.
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if starts:
+        text = text[min(starts) :]
+    obj, _end = json.JSONDecoder().raw_decode(text)
+    return obj
 
 
 def _normalize_enums(data: dict) -> dict:
