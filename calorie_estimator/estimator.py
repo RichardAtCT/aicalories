@@ -235,13 +235,8 @@ class CalorieEstimator:
         items_with_candidates = await self._stage_2_lookup(analysis)
 
         if not any(ic.get("candidates") for ic in items_with_candidates):
-            return MealEstimate(
-                warnings=[
-                    "No matching nutrition data found for the items described. "
-                    "Try more common food names."
-                ],
-                meal_context=analysis.meal_context,
-            )
+            logger.info("No USDA candidates; using LLM text fallback")
+            return await self._fallback_estimate_from_text(description, analysis)
 
         logger.info("Stage 3 (text): disambiguation")
         matches = await self._stage_3_disambiguate(
@@ -799,6 +794,118 @@ class CalorieEstimator:
             warnings=warnings,
         )
 
+    async def _fallback_estimate_from_text(
+        self,
+        description: str,
+        analysis: VisualAnalysis,
+    ) -> MealEstimate:
+        """Single-pass LLM estimation for a text description when Stage 2
+        produced no USDA matches. Reuses FALLBACK_SYSTEM but feeds the
+        Stage 1 extracted items as structured context so the LLM fills in
+        nutrition rather than re-identifying from scratch. Confidence is
+        capped so the agent's low-confidence hint reliably triggers."""
+        items_context = "\n".join(
+            f"- {fi.name}"
+            + (f" ({fi.cooking_method})" if fi.cooking_method else "")
+            + (f", ~{fi.estimated_weight_g:.0f}g" if fi.estimated_weight_g else "")
+            for fi in analysis.items
+        )
+        user_text = (
+            f'User description: "{description}"\n\n'
+            "Stage 1 already extracted these items:\n"
+            f"{items_context}\n\n"
+            "No USDA match was found. Estimate per-item calories and macros "
+            "from the description and items above using your internal "
+            "reference values. Return the standard JSON shape."
+        )
+
+        response_text = await self._call_llm(
+            system=FALLBACK_SYSTEM,
+            user_text=user_text,
+        )
+
+        try:
+            data = _parse_json(response_text)
+        except Exception as e:
+            logger.error(f"Failed to parse text-fallback output: {e}")
+            return MealEstimate(
+                warnings=[
+                    "LLM-estimated nutrition (item not in USDA data) — "
+                    "parse failed, please rephrase."
+                ],
+                meal_context=analysis.meal_context,
+            )
+
+        items: list[ItemEstimate] = []
+        for raw_item in data.get("items", []):
+            nutrients = NutrientProfile(
+                calories=raw_item.get("calories", 0),
+                protein_g=raw_item.get("protein_g", 0),
+                fat_g=raw_item.get("fat_g", 0),
+                carbs_g=raw_item.get("carbs_g", 0),
+                fiber_g=raw_item.get("fiber_g", 0),
+            )
+            raw_conf = raw_item.get("confidence", 0.4)
+            try:
+                capped_conf = min(float(raw_conf), 0.6)
+            except (TypeError, ValueError):
+                capped_conf = 0.4
+            items.append(
+                ItemEstimate(
+                    name=raw_item.get("name", "Unknown"),
+                    weight_g=raw_item.get("weight_g", 0),
+                    nutrients=nutrients,
+                    confidence=capped_conf,
+                    notes=raw_item.get("notes", ""),
+                )
+            )
+
+        if not items:
+            return MealEstimate(
+                warnings=[
+                    "LLM-estimated nutrition (item not in USDA data) — "
+                    "no items returned, please rephrase."
+                ],
+                meal_context=analysis.meal_context,
+            )
+
+        meal_total = NutrientProfile()
+        for item in items:
+            meal_total = meal_total + item.nutrients
+
+        hidden = [
+            HiddenCalorieEstimate(
+                source=h["source"],
+                estimated_calories=h["calories"],
+                note=h.get("note", ""),
+            )
+            for h in data.get("hidden_calories", [])
+        ]
+
+        total_with_hidden = NutrientProfile(
+            calories=meal_total.calories + sum(h.estimated_calories for h in hidden),
+            protein_g=meal_total.protein_g,
+            fat_g=meal_total.fat_g,
+            carbs_g=meal_total.carbs_g,
+            fiber_g=meal_total.fiber_g,
+        )
+
+        warnings = list(data.get("warnings", []))
+        warnings.insert(
+            0,
+            "LLM-estimated nutrition (item not in USDA data) — less precise",
+        )
+
+        return MealEstimate(
+            items=items,
+            hidden_calories=hidden,
+            total=meal_total,
+            total_with_hidden=total_with_hidden,
+            overall_confidence=min(0.6, sum(i.confidence for i in items) / len(items)),
+            warnings=warnings,
+            meal_context=analysis.meal_context,
+        )
+
     # ─────────────────────────────────────────────────────────
     # LLM Calling (Anthropic / OpenAI)
     # ─────────────────────────────────────────────────────────
@@ -1232,11 +1339,67 @@ def _parse_json(text: str) -> dict:
 def _normalize_enums(data: dict) -> dict:
     """Normalize LLM enum outputs to valid values.
 
-    The LLM sometimes returns descriptive strings like "good natural light"
-    instead of the strict enum value "good". Map them to the nearest valid
-    ImageQuality value before Pydantic validation.
+    Covers two failure modes we've observed:
+    - ImageQuality: LLM returns descriptive strings like "good natural light"
+      instead of the strict enum value "good".
+    - FoodCategory: LLM returns singular/synonym variants like "beverage"
+      instead of "beverages". Pydantic rejects these and silently loses
+      the entire Stage 1 output.
     """
     _QUALITY_MAP = {"good": "good", "moderate": "moderate", "poor": "poor"}
+
+    # Ordered: exact valid values first (short-circuit), then common
+    # singular/synonym fallbacks mapped to their canonical plural enum value.
+    _CATEGORY_ALIASES = {
+        # exact (no-op — kept for completeness / future generalisation)
+        "proteins": "proteins",
+        "grains_starches": "grains_starches",
+        "vegetables": "vegetables",
+        "fruits": "fruits",
+        "dairy": "dairy",
+        "sauces_dressings": "sauces_dressings",
+        "beverages": "beverages",
+        "nuts_seeds": "nuts_seeds",
+        "oils_fats": "oils_fats",
+        "sweets_desserts": "sweets_desserts",
+        "mixed_dishes": "mixed_dishes",
+        "other": "other",
+        # common LLM variants
+        "protein": "proteins",
+        "meat": "proteins",
+        "grain": "grains_starches",
+        "grains": "grains_starches",
+        "starch": "grains_starches",
+        "starches": "grains_starches",
+        "vegetable": "vegetables",
+        "veg": "vegetables",
+        "veggies": "vegetables",
+        "fruit": "fruits",
+        "sauce": "sauces_dressings",
+        "sauces": "sauces_dressings",
+        "dressing": "sauces_dressings",
+        "dressings": "sauces_dressings",
+        "condiment": "sauces_dressings",
+        "condiments": "sauces_dressings",
+        "beverage": "beverages",
+        "drink": "beverages",
+        "drinks": "beverages",
+        "nut": "nuts_seeds",
+        "nuts": "nuts_seeds",
+        "seed": "nuts_seeds",
+        "seeds": "nuts_seeds",
+        "oil": "oils_fats",
+        "oils": "oils_fats",
+        "fat": "oils_fats",
+        "fats": "oils_fats",
+        "sweet": "sweets_desserts",
+        "sweets": "sweets_desserts",
+        "dessert": "sweets_desserts",
+        "desserts": "sweets_desserts",
+        "mixed_dish": "mixed_dishes",
+        "mixed": "mixed_dishes",
+        "combo": "mixed_dishes",
+    }
 
     def _coerce_quality(val: str) -> str:
         if not isinstance(val, str):
@@ -1247,10 +1410,22 @@ def _normalize_enums(data: dict) -> dict:
                 return key
         return "moderate"
 
+    def _coerce_category(val) -> str:
+        if not isinstance(val, str):
+            return "other"
+        v = val.strip().lower().replace("-", "_").replace(" ", "_")
+        return _CATEGORY_ALIASES.get(v, "other")
+
     scene = data.get("scene", {})
     if isinstance(scene, dict):
         for field in ("lighting_quality", "image_quality"):
             if field in scene:
                 scene[field] = _coerce_quality(scene[field])
+
+    items = data.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and "category" in item:
+                item["category"] = _coerce_category(item["category"])
 
     return data
