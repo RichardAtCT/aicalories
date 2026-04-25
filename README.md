@@ -47,6 +47,23 @@ Agent (Telegram bot, etc.)
 Agent formats response for user
 ```
 
+### Text-only and no-USDA-match fallbacks
+
+Two single-pass LLM fallbacks share `FALLBACK_SYSTEM` and exist so a
+caller never has to invent a "we couldn't estimate that" message:
+
+- **Image path, USDA API down** → `_fallback_estimate` runs Stage 1's LLM
+  pass and asks it to also fill in nutrition directly.
+- **Text path, Stage 2 returns no candidates** (`estimate_from_text`) →
+  `_fallback_estimate_from_text` reuses the Stage 1 extracted items as
+  structured context and asks the LLM to fill in nutrition. So a generic
+  description like `"a beer"` returns ~150 kcal with confidence ≤ 0.6
+  and a `"LLM-estimated nutrition (item not in USDA data) — less precise"`
+  warning, instead of an empty `MealEstimate`.
+
+In both cases `overall_confidence` is capped at 0.6 and the warning is
+prepended so downstream knows this is the lower-precision path.
+
 ### Packaged foods (barcode path)
 
 If a UPC/EAN is visible in the photo, Stage 0 decodes it with `pyzbar` and

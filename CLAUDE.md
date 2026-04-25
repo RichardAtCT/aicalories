@@ -32,7 +32,7 @@ There is no test suite, build system, or linting configuration. The project is a
 
 - **estimator.py** — `CalorieEstimator` class orchestrating the 4-stage pipeline. Handles LLM provider abstraction (Anthropic default, OpenAI fallback) and JSON parsing from LLM outputs.
 - **models.py** — Pydantic v2 models: `FoodItem`, `VisualAnalysis`, `USDACandidate`, `FoodMatch`, `NutrientProfile` (supports arithmetic), `MealEstimate` (has `format_summary()`).
-- **prompts.py** — System/user prompts for Stage 1 (chain-of-thought visual analysis) and Stage 3 (disambiguation against USDA candidates). Also has `FALLBACK_SYSTEM` for single-pass mode.
+- **prompts.py** — System/user prompts for Stage 1 (chain-of-thought visual analysis), Stage 3 (disambiguation against USDA candidates), and `TEXT_EXTRACTION_SYSTEM` for the text-only Stage 1. Also has `FALLBACK_SYSTEM` used by both single-pass fallbacks: image path when the USDA API is down (`_fallback_estimate`) and text path when Stage 2 returns no candidates (`_fallback_estimate_from_text`).
 - **usda.py** — Async `USDAClient` using `httpx`. Searches FDC v1 API, prefers Survey (FNDDS) data types. Falls back to bundled `common_foods.json`.
 - **corrections.py** — Per-category weight bias multipliers (e.g., grains +15%, sauces +30%) and hidden calorie heuristics (cooking oil, butter, dressing).
 - **telegram_bot.py** — Example Telegram bot integration.
@@ -42,5 +42,6 @@ There is no test suite, build system, or linting configuration. The project is a
 - Async-first (`async/await` throughout, `httpx.AsyncClient`)
 - Two LLM passes: perception first, then disambiguation against real DB entries
 - Low temperature (0.1) for deterministic outputs
-- Graceful degradation: if USDA API fails, falls back to single-pass LLM estimation
+- Graceful degradation: if Stage 2 returns no candidates (text path) or the USDA API fails (image path), falls back to a single-pass LLM estimate. The fallback prepends `"LLM-estimated nutrition (item not in USDA data) — less precise"` to `warnings`, caps `overall_confidence` at 0.6, and never returns a fully empty `MealEstimate` for a reasonable description (so callers don't have to invent their own clarifier).
+- Defensive enum coercion: `_normalize_enums` maps `FoodCategory` singulars and synonyms (`beverage` → `beverages`, `veg` → `vegetables`, unknown → `other`) so the LLM occasionally returning the singular form doesn't silently void Stage 1 via Pydantic validation failure.
 - `NutrientProfile` supports `+` operator and `.scale()` for aggregation
